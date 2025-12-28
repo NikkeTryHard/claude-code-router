@@ -51,7 +51,7 @@ async function waitForService(
 
   const startTime = Date.now();
   while (Date.now() - startTime < timeout) {
-    const isRunning = await isServiceRunning()
+    const isRunning = await isServiceRunning();
     if (isRunning) {
       // Wait for an additional short period to ensure service is fully ready
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -63,10 +63,10 @@ async function waitForService(
 }
 
 async function main() {
-  const isRunning = await isServiceRunning()
+  const isRunning = await isServiceRunning();
   switch (command) {
     case "start":
-      run();
+      await run();
       break;
     case "stop":
       try {

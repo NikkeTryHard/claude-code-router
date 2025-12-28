@@ -2,13 +2,117 @@ import Server from "@musistudio/llms";
 import { readConfigFile, writeConfigFile, backupConfigFile } from "./utils";
 import { checkForUpdates, performUpdate } from "./utils";
 import { join } from "path";
+import path from "path";
 import fastifyStatic from "@fastify/static";
 import { readdirSync, statSync, readFileSync, writeFileSync, existsSync } from "fs";
 import { homedir } from "os";
 import {calculateTokenCount} from "./utils/router";
 
+/**
+ * Load custom transformers from config.
+ * This function handles absolute paths correctly and provides detailed error logging.
+ */
+async function loadCustomTransformers(server: Server, config: any): Promise<void> {
+  const transformers = config.transformers || [];
+  const log = server.app.log;
+
+  if (transformers.length === 0) {
+    return;
+  }
+
+  log.info(`[CCR] Loading ${transformers.length} custom transformer(s)...`);
+
+  for (const transformerConfig of transformers) {
+    const { name, path: transformerPath, options = {} } = transformerConfig;
+
+    if (!transformerPath) {
+      log.error(`[CCR] Transformer "${name}" has no path specified, skipping.`);
+      continue;
+    }
+
+    try {
+      // Resolve the path - handle both absolute and relative paths
+      let resolvedPath: string;
+      if (path.isAbsolute(transformerPath)) {
+        resolvedPath = transformerPath;
+      } else {
+        // Relative to config directory
+        resolvedPath = join(homedir(), ".claude-code-router", transformerPath);
+      }
+
+      // Check if file exists
+      if (!existsSync(resolvedPath)) {
+        log.error(`[CCR] Transformer file not found: ${resolvedPath}`);
+        continue;
+      }
+
+      // Clear require cache to allow hot-reloading
+      delete require.cache[require.resolve(resolvedPath)];
+
+      // Load the transformer module
+      const TransformerModule = require(resolvedPath);
+
+      // Handle both class exports and default exports
+      const TransformerClass = TransformerModule.default || TransformerModule;
+
+      if (typeof TransformerClass !== "function") {
+        log.error(`[CCR] Transformer "${name}" at ${resolvedPath} does not export a class/constructor.`);
+        continue;
+      }
+
+      // Instantiate the transformer
+      const instance = new TransformerClass(options);
+
+      // Inject logger if available
+      if (instance && typeof instance === "object") {
+        instance.logger = log;
+      }
+
+      // Validate the instance has a name
+      if (!instance.name) {
+        log.error(`[CCR] Transformer instance from ${resolvedPath} does not have a 'name' property.`);
+        continue;
+      }
+
+      // Wait for transformerService to be available
+      const waitForService = async (retries = 10): Promise<boolean> => {
+        for (let i = 0; i < retries; i++) {
+          if (server.app._server?.transformerService) {
+            return true;
+          }
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        return false;
+      };
+
+      const serviceReady = await waitForService();
+      if (!serviceReady) {
+        log.error(`[CCR] TransformerService not available after waiting, cannot register "${instance.name}".`);
+        continue;
+      }
+
+      // Register the transformer
+      server.app._server!.transformerService.registerTransformer(instance.name, instance);
+      log.info(`[CCR] Successfully loaded custom transformer: "${instance.name}" from ${resolvedPath}`);
+
+    } catch (error: any) {
+      log.error(`[CCR] Failed to load transformer "${name}" from ${transformerPath}: ${error.message}`);
+      if (error.stack) {
+        log.error(`[CCR] Stack: ${error.stack}`);
+      }
+    }
+  }
+}
+
 export const createServer = (config: any): Server => {
   const server = new Server(config);
+
+  // Load custom transformers after server initialization
+  // Use onReady hook to ensure transformerService is available
+  server.app.addHook("onReady", async () => {
+    const fullConfig = await readConfigFile();
+    await loadCustomTransformers(server, fullConfig);
+  });
 
   server.app.post("/v1/messages/count_tokens", async (req, reply) => {
     const {messages, tools, system} = req.body;

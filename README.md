@@ -1,5 +1,7 @@
 ![](blog/images/claude-code-router-img.png)
 
+> **Fork Notice**: This is a modified fork of [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) with the `nativeFormat` patch for native Anthropic API passthrough support. See [Fork-Specific Changes](#fork-specific-changes-nativeformat-patch) below.
+
 [![](https://img.shields.io/badge/%F0%9F%87%A8%F0%9F%87%B3-%E4%B8%AD%E6%96%87%E7%89%88-ff0000?style=flat)](README_zh.md)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white)](https://discord.gg/rdftVMaUcS)
 [![](https://img.shields.io/github/license/musistudio/claude-code-router)](https://github.com/musistudio/claude-code-router/blob/main/LICENSE)
@@ -535,6 +537,68 @@ This setup allows for interesting automations, like running tasks during off-pea
 - [Project Motivation and How It Works](blog/en/project-motivation-and-how-it-works.md)
 - [Maybe We Can Do More with the Router](blog/en/maybe-we-can-do-more-with-the-route.md)
 - [GLM-4.6 Supports Reasoning and Interleaved Thinking](blog/en/glm-4.6-supports-reasoning.md)
+
+## Fork-Specific Changes: nativeFormat Patch
+
+This fork includes a critical patch for providers that return responses in **native Anthropic format** (such as `gcli2api` or other Anthropic-compatible proxies).
+
+### Problem
+
+When using providers that proxy to Anthropic-compatible APIs:
+1. The upstream API returns responses in **native Anthropic format**
+2. CCR's built-in `Anthropic` transformer incorrectly tried to convert these responses **from OpenAI to Anthropic format**
+3. This resulted in empty output or "Provider error" messages in `claude-code` CLI
+
+### Solution: The `nativeFormat` Flag
+
+A patch is applied to `@musistudio/llms` library that adds a `nativeFormat` flag to bypass response transformation.
+
+#### Usage
+
+Add `nativeFormat: true` to your provider configuration in `~/.claude-code-router/config.json`:
+
+```json
+{
+  "Providers": [
+    {
+      "name": "my-anthropic-proxy",
+      "api_base_url": "http://127.0.0.1:7861/v1/messages",
+      "api_key": "your-key",
+      "nativeFormat": true,
+      "models": ["claude-sonnet-4-5", "claude-opus-4-5"],
+      "transformer": {
+        "use": ["xml-thinking"]
+      }
+    }
+  ]
+}
+```
+
+#### How It Works
+
+1. When CCR loads a provider with `nativeFormat: true`, this flag is passed to `registerProvider()`
+2. When processing a response, the library's bypass function checks `provider.nativeFormat`
+3. If `true`, it skips the OpenAI-to-Anthropic conversion
+4. The native Anthropic response passes through unchanged to the CLI
+
+#### Included Files
+
+- **`patches/@musistudio+llms+1.0.51.patch`** - Auto-applied on `npm install` via `patch-package`
+- **`scripts/xml-thinking.js`** - Custom transformer for converting JSON thinking blocks to XML format
+
+#### Installation from This Fork
+
+```bash
+git clone https://github.com/YOUR_USERNAME/claude-code-router.git
+cd claude-code-router
+npm install
+npm run build
+npm link  # or: sudo npm link
+```
+
+The patch is automatically applied during `npm install` via the `postinstall` script.
+
+---
 
 ## ❤️ Support & Sponsoring
 

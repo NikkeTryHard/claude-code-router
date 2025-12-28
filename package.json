@@ -7,7 +7,8 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
-    "release": "npm run build && npm publish"
+    "release": "npm run build && npm publish",
+    "postinstall": "patch-package"
   },
   "keywords": [
     "claude",
@@ -20,8 +21,8 @@
   "license": "MIT",
   "dependencies": {
     "@fastify/static": "^8.2.0",
-    "@musistudio/llms": "^1.0.51",
     "@inquirer/prompts": "^5.0.0",
+    "@musistudio/llms": "^1.0.51",
     "dotenv": "^16.4.7",
     "find-process": "^2.0.0",
     "json5": "^2.2.3",
@@ -37,6 +38,7 @@
     "@types/node": "^24.0.15",
     "esbuild": "^0.25.1",
     "fastify": "^5.4.0",
+    "patch-package": "^8.0.1",
     "shx": "^0.4.0",
     "typescript": "^5.8.2"
   },
