@@ -6,4 +6,8 @@ dist
 .DS_Store
 .vscode
 tsconfig.tsbuildinfo
-ui/tsconfig.tsbuildinfo
+**/tsconfig.tsbuildinfo
+
+# Local convenience scripts
+*.bat
+*.ps1
