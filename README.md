@@ -1,6 +1,7 @@
 ![](blog/images/claude-code-router-img.png)
 
-> **Fork Notice**: This is a modified fork of [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) with the `nativeFormat` patch for native Anthropic API passthrough support. See [Fork-Specific Changes](#fork-specific-changes-nativeformat-patch) below.
+> [!IMPORTANT]
+> **Fork Notice**: This is a modified fork of [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) with the `nativeFormat` patch for native Anthropic API passthrough support. See [Fork-Specific Changes](#fork-specific-changes-native-anthropic-api-compatibility) below.
 
 [![](https://img.shields.io/badge/%F0%9F%87%A8%F0%9F%87%B3-%E4%B8%AD%E6%96%87%E7%89%88-ff0000?style=flat)](README_zh.md)
 [![Discord](https://img.shields.io/badge/Discord-%235865F2.svg?&logo=discord&logoColor=white)](https://discord.gg/rdftVMaUcS)
