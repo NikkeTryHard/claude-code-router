@@ -538,65 +538,477 @@ This setup allows for interesting automations, like running tasks during off-pea
 - [Maybe We Can Do More with the Router](blog/en/maybe-we-can-do-more-with-the-route.md)
 - [GLM-4.6 Supports Reasoning and Interleaved Thinking](blog/en/glm-4.6-supports-reasoning.md)
 
-## Fork-Specific Changes: nativeFormat Patch
+## Fork-Specific Changes: Native Anthropic API Compatibility
 
-This fork includes a critical patch for providers that return responses in **native Anthropic format** (such as `gcli2api` or other Anthropic-compatible proxies).
+> **Fork Notice**: This is a modified fork of [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router) with patches enabling native Anthropic API passthrough support for providers like `gcli2api`, Antigravity, and similar Anthropic-compatible proxies.
 
-### Problem
+---
 
-When using providers that proxy to Anthropic-compatible APIs:
-1. The upstream API returns responses in **native Anthropic format**
-2. CCR's built-in `Anthropic` transformer incorrectly tried to convert these responses **from OpenAI to Anthropic format**
-3. This resulted in empty output or "Provider error" messages in `claude-code` CLI
+### Table of Contents (Fork-Specific)
+- [Architecture Overview](#architecture-overview)
+- [The nativeFormat Flag](#the-nativeformat-flag)
+- [Key Issue: System Field Conversion](#key-issue-1-system-field-conversion)
+- [Key Issue: Provider Lookup for Bypass](#key-issue-2-provider-lookup-for-bypass-logic)
+- [Key Issue: Thinking Block Handling](#key-issue-3-thinking-block-handling)
+- [Complete Configuration Example](#complete-configuration-example)
+- [Modified Files Reference](#modified-files-reference)
+- [Data Flow Diagrams](#data-flow-diagrams)
+- [Known Issues & Workarounds](#known-issues--workarounds)
+- [Future Development Plans](#future-development-plans)
+- [Developer Notes](#developer-notes)
 
-### Solution: The `nativeFormat` Flag
+---
 
-A patch is applied to `@musistudio/llms` library that adds a `nativeFormat` flag to bypass response transformation.
+### Architecture Overview
 
-#### Usage
+```mermaid
+flowchart TB
+    subgraph Claude["Claude Code CLI"]
+        CC["WSL2 or native<br/>Sends Anthropic format"]
+    end
+    
+    subgraph CCR["CCR - Claude Code Router<br/>localhost:3456"]
+        subgraph PreHandler["PreHandler Pipeline"]
+            Auth["1. apiKeyAuth - Authentication"]
+            Agents["2. agentsManager - Agent tool injection"]
+            Router["3. router - Model routing<br/>+ req.provider extraction 🔧 PATCHED"]
+        end
+        subgraph Endpoint["Endpoint Handler - f0 function"]
+            D0["d0 - Request transformation"]
+            H0["h0 - Check nativeFormat → bypass=true"]
+            P0["p0 - HTTP request to provider"]
+            M0["m0 - Response transformation<br/>⚡ SKIPPED if bypass=true"]
+            G0["g0 - Stream response to client"]
+        end
+    end
+    
+    subgraph GCLI["gcli2api / Antigravity<br/>localhost:7861"]
+        Proxy["Credential rotation<br/>Native Anthropic SSE stream"]
+    end
+    
+    subgraph Anthropic["Anthropic API"]
+        API["api.anthropic.com/v1/messages"]
+    end
+    
+    CC -->|"POST /v1/messages"| Auth
+    Auth --> Agents --> Router
+    Router --> D0 --> H0 --> P0
+    P0 -->|"POST /antigravity/v1/messages"| Proxy
+    Proxy --> API
+    API -->|"SSE Stream"| Proxy
+    Proxy -->|"Native Anthropic SSE"| M0
+    M0 --> G0
+    G0 -->|"Stream to client"| CC
+```
 
-Add `nativeFormat: true` to your provider configuration in `~/.claude-code-router/config.json`:
+---
+
+### The nativeFormat Flag
+
+#### Problem Statement
+
+CCR was designed to route requests to **OpenAI-compatible providers** and convert responses to Anthropic format. The built-in `Anthropic` transformer:
+
+1. **Request transformation** (`transformRequestOut`): Converts Anthropic → OpenAI format
+2. **Response transformation** (`transformResponseIn`): Converts OpenAI → Anthropic SSE format
+
+For providers that **already speak native Anthropic format** (like gcli2api proxying to Anthropic's API), this double-conversion causes:
+- Empty SSE responses (content blocks not parsed correctly)
+- "Provider error" messages
+- Token counting failures
+
+#### Solution: The `nativeFormat` Flag
+
+A patch to `@musistudio/llms` library adds provider-level bypass:
+
+```javascript
+// In @musistudio/llms library (patched)
+function h0(provider, transformer, requestBody) {
+  if (provider.nativeFormat) return true;  // ← BYPASS all transformations
+  // ... original logic
+}
+```
+
+When `bypass = true`:
+- `transformRequestIn/Out` are skipped
+- `transformResponseIn/Out` are skipped
+- Raw Anthropic SSE stream passes through unchanged
+
+#### Configuration
 
 ```json
 {
-  "Providers": [
+  "name": "antigravity",
+  "api_base_url": "http://127.0.0.1:7861/antigravity/v1/messages",
+  "api_key": "your-key",
+  "nativeFormat": true,
+  "models": ["claude-sonnet-4-5", "claude-opus-4-5"],
+  "transformer": {
+    "use": ["anthropic-passthrough"]
+  }
+}
+```
+
+---
+
+### Key Issue 1: System Field Conversion
+
+#### Root Cause Analysis
+
+CCR's internal request processing (likely in `@musistudio/llms` library) converts the Anthropic `system` field to an OpenAI-style message:
+
+```javascript
+// Anthropic native format (what Claude Code sends):
+{
+  "system": [{"type": "text", "text": "You are a helpful assistant..."}],
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+
+// After CCR's internal conversion (WRONG for nativeFormat providers):
+{
+  "messages": [
+    {"role": "system", "content": [{"type": "text", "text": "You are a helpful assistant..."}]},
+    {"role": "user", "content": "Hello"}
+  ]
+}
+```
+
+gcli2api and Anthropic's actual API **reject** requests with `role: system` messages - they expect the separate `system` field.
+
+#### Fix Location
+
+`scripts/anthropic-passthrough.js` - `transformRequestIn()` method:
+
+```javascript
+// Restore system field from role:system messages
+const systemMessages = [];
+const nonSystemMessages = [];
+
+for (const msg of body.messages) {
+  if (msg.role === 'system') {
+    // Collect system message content
+    if (Array.isArray(msg.content)) {
+      systemMessages.push(...msg.content);
+    } else if (typeof msg.content === 'string') {
+      systemMessages.push({ type: 'text', text: msg.content });
+    }
+  } else {
+    nonSystemMessages.push(msg);
+  }
+}
+
+if (systemMessages.length > 0) {
+  body.system = systemMessages;
+  body.messages = nonSystemMessages;
+}
+```
+
+---
+
+### Key Issue 2: Provider Lookup for Bypass Logic
+
+#### Root Cause Analysis
+
+The endpoint handler `f0` in `@musistudio/llms` looks up the provider config using `req.provider`:
+
+```javascript
+// dist/cli.js line 79965
+let o = r.body, i = r.provider, u = t._server.providerService.getProvider(i);
+```
+
+The router middleware set `req.body.model = "antigravity,claude-opus-4-5"` but **never set** `req.provider`. Result: `i = undefined`, provider lookup fails, `nativeFormat` check never happens.
+
+#### Fix Location
+
+`src/utils/router.ts` - after setting the model:
+
+```typescript
+req.body.model = model;
+
+// Set provider from model name for nativeFormat bypass logic
+if (model && model.includes(',')) {
+  req.provider = model.split(',')[0];
+}
+```
+
+This ensures `req.provider = "antigravity"` so the provider config with `nativeFormat: true` is correctly retrieved.
+
+---
+
+### Key Issue 3: Thinking Block Handling
+
+#### Root Cause Analysis
+
+When Claude Code sends conversation history with thinking blocks, the format is:
+
+```json
+{
+  "thinking": {"budget_tokens": 21332, "type": "enabled"},
+  "messages": [
     {
-      "name": "my-anthropic-proxy",
-      "api_base_url": "http://127.0.0.1:7861/v1/messages",
-      "api_key": "your-key",
-      "nativeFormat": true,
-      "models": ["claude-sonnet-4-5", "claude-opus-4-5"],
-      "transformer": {
-        "use": ["xml-thinking"]
-      }
+      "role": "assistant",
+      "content": [
+        {"type": "thinking", "thinking": "Let me think...", "signature": "..."},
+        {"type": "text", "text": "Here's my response..."}
+      ]
     }
   ]
 }
 ```
 
-#### How It Works
+The original `anthropic-passthrough` transformer converted thinking blocks to XML text:
 
-1. When CCR loads a provider with `nativeFormat: true`, this flag is passed to `registerProvider()`
-2. When processing a response, the library's bypass function checks `provider.nativeFormat`
-3. If `true`, it skips the OpenAI-to-Anthropic conversion
-4. The native Anthropic response passes through unchanged to the CLI
+```javascript
+// WRONG - breaks the API when thinking is enabled
+const xmlThought = `<thinking>\n${thinkingText}\n</thinking>`;
+msg.content = [{ type: 'text', text: xmlThought + '\n\n' + standardText }];
+```
 
-#### Included Files
+This caused the Anthropic API error:
+> "When thinking is disabled, an `assistant` message in the final position cannot contain `thinking`. To use thinking blocks, enable `thinking` in your request."
 
-- **`patches/@musistudio+llms+1.0.51.patch`** - Auto-applied on `npm install` via `patch-package`
-- **`scripts/xml-thinking.js`** - Custom transformer for converting JSON thinking blocks to XML format
+The issue: We stripped the `thinking` type blocks but kept `thinking` parameter, creating an inconsistent state.
 
-#### Installation from This Fork
+#### Fix: Conditional Thinking Block Handling
+
+`scripts/anthropic-passthrough.js` now checks if thinking is enabled:
+
+```javascript
+const thinkingEnabled = body.thinking && body.thinking.type === 'enabled';
+
+if (thinkingEnabled) {
+  // PRESERVE native thinking blocks - Anthropic API expects them
+  this.log('info', `Thinking enabled - preserving native thinking blocks`);
+} else {
+  // CONVERT to XML - for backward compatibility with non-thinking-aware providers
+  body.messages = body.messages.map((msg, idx) => {
+    if (msg.role === 'assistant' && Array.isArray(msg.content)) {
+      // ... XML conversion logic
+    }
+    return msg;
+  });
+}
+```
+
+---
+
+### Complete Configuration Example
+
+```json
+{
+  "APIKEY": "",
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "LOG": true,
+  "LOG_LEVEL": "debug",
+  "transformers": [
+    {
+      "name": "anthropic-passthrough",
+      "path": "C:/Users/louis/Desktop/claude-code-router/scripts/anthropic-passthrough.js"
+    }
+  ],
+  "Providers": [
+    {
+      "name": "antigravity",
+      "api_base_url": "http://127.0.0.1:7861/antigravity/v1/messages",
+      "api_key": "pwd",
+      "nativeFormat": true,
+      "models": [
+        "claude-sonnet-4-5",
+        "claude-opus-4-5",
+        "gemini-3-pro-preview"
+      ],
+      "transformer": {
+        "use": ["anthropic-passthrough"]
+      }
+    }
+  ],
+  "Router": {
+    "default": "antigravity,claude-opus-4-5",
+    "background": "antigravity,claude-sonnet-4-5",
+    "think": "antigravity,claude-opus-4-5",
+    "longContext": "antigravity,gemini-3-pro-preview",
+    "longContextThreshold": 200000
+  }
+}
+```
+
+---
+
+### Modified Files Reference
+
+| File | Purpose | Key Changes |
+|------|---------|-------------|
+| `patches/@musistudio+llms+1.0.51.patch` | Library patch (auto-applied via `patch-package`) | Adds `nativeFormat` support to bypass logic |
+| `src/utils/router.ts` | Request routing middleware | Extracts provider name from model, sets `req.provider` |
+| `scripts/anthropic-passthrough.js` | Custom transformer | Restores `system` field, conditional thinking block handling |
+| `~/.claude-code-router/config.json` | Runtime configuration | Provider configs with `nativeFormat: true` |
+
+---
+
+### Data Flow Diagrams
+
+#### Request Flow (with nativeFormat: true)
+
+```mermaid
+flowchart TD
+    A["Claude Code CLI"] -->|"POST /v1/messages"| B["CCR PreHandler"]
+    B --> C["router.ts<br/>Sets req.provider 🔧"]
+    C --> D["f0 endpoint handler"]
+    D --> E["d0 - Request transform"]
+    E --> F{"h0 - nativeFormat?"}
+    F -->|"true"| G["bypass = true"]
+    G --> H["anthropic-passthrough.transformRequestIn"]
+    H --> I["Restore system field"]
+    I --> J{"thinking.type?"}
+    J -->|"enabled"| K["Preserve thinking blocks"]
+    J -->|"disabled"| L["Convert to XML"]
+    K --> M["p0 - HTTP POST"]
+    L --> M
+    M -->|"POST /antigravity/v1/messages"| N["gcli2api"]
+    N --> O["Anthropic API"]
+    O -->|"Native SSE Stream"| P["Response"]
+    P --> Q["m0 - bypass=true"]
+    Q -->|"SKIP transformResponseIn"| R["g0 - Stream to client"]
+    R --> A
+```
+
+#### Response SSE Format (Native Anthropic)
+
+```
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_...","type":"message","role":"assistant","content":[],"model":"claude-opus-4-5","stop_reason":null,"usage":{"input_tokens":1234,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"Let me analyze..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Here's my response..."}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":567}}
+
+event: message_stop
+data: {"type":"message_stop"}
+```
+
+---
+
+### Known Issues & Workarounds
+
+#### 1. Windows asyncio Errors (Cosmetic)
+
+**Symptom**: `ConnectionResetError: [WinError 10054]` in gcli2api logs
+
+**Cause**: Windows asyncio `ProactorEventLoop` fails to cleanly shutdown sockets closed by client
+
+**Impact**: None - requests complete successfully
+
+**Workaround**: Ignore these errors; they're cosmetic
+
+#### 2. Route POST:/api/event_logging/batch not found
+
+**Symptom**: 404 errors in CCR logs for `/api/event_logging/batch`
+
+**Cause**: Claude Code sends telemetry that CCR doesn't handle
+
+**Impact**: None - telemetry is optional
+
+**Workaround**: Ignore or add stub route
+
+#### 3. Timeout on Long Thinking Requests
+
+**Symptom**: `fetch failed` errors after 60+ seconds
+
+**Cause**: Default timeout may be too short for thinking-heavy requests
+
+**Workaround**: Increase `API_TIMEOUT_MS` in config.json:
+```json
+{"API_TIMEOUT_MS": 600000}
+```
+
+---
+
+### Future Development Plans
+
+#### Short-Term (Fix as Issues Arise)
+- [ ] Handle edge cases in thinking block format differences
+- [ ] Add better error messages for common configuration mistakes
+- [ ] Improve logging for debugging provider communication
+
+#### Medium-Term (Proactive Improvements)
+- [ ] **Response Validation Layer**: Debug mode to log request/response at each transformation stage
+- [ ] **Streaming Health Check**: Detect and log when SSE stream has content but no blocks
+- [ ] **Auto-Detect Native Format**: Probe provider's response format instead of requiring manual config
+
+#### Long-Term (Architecture)
+- [ ] **Upstream Contribution**: Submit `req.provider` fix to upstream CCR
+- [ ] **Native Provider Type**: First-class `type: "anthropic-native"` provider instead of `nativeFormat` flag
+- [ ] **Transformer Chain Visualization**: UI to see transformation pipeline for debugging
+
+---
+
+### Developer Notes
+
+#### Building from Source
 
 ```bash
 git clone https://github.com/YOUR_USERNAME/claude-code-router.git
 cd claude-code-router
-npm install
-npm run build
-npm link  # or: sudo npm link
+npm install          # Automatically applies patches via postinstall
+npm run build        # Compiles TypeScript → dist/cli.js
+npm link             # Global install for local testing
 ```
 
-The patch is automatically applied during `npm install` via the `postinstall` script.
+#### Testing Changes
+
+1. **Restart required** after modifying:
+   - `src/**/*.ts` (requires `npm run build` first)
+   - `~/.claude-code-router/config.json`
+
+2. **No restart required** for:
+   - `scripts/*.js` (transformers are loaded fresh on each request)
+
+3. **Quick test script**:
+```powershell
+# Test basic streaming
+powershell.exe -ExecutionPolicy Bypass -File "ccr-debug-test.ps1"
+
+# Expected: 900+ chars = working, ~475 chars = empty wrapper (broken)
+```
+
+#### Key Code Locations in @musistudio/llms
+
+All compiled into `dist/cli.js`:
+
+| Function | Line (approx) | Purpose |
+|----------|---------------|---------|
+| `f0` | 79964 | Endpoint handler entry point |
+| `d0` | 79970 | Request transformation & bypass detection |
+| `h0` | 79984 | Bypass condition check (`nativeFormat`) |
+| `p0` | 79988 | HTTP request to provider |
+| `m0` | 80007 | Response transformation (skipped if bypass) |
+| `g0` | 80013 | Stream response to client |
+| `bo` (class) | 80231 | Built-in Anthropic transformer |
+
+#### Debugging Tips
+
+1. **Enable debug logging**: Set `LOG_LEVEL: "debug"` in config
+2. **Check CCR logs**: `~/.claude-code-router/logs/ccr-*.log`
+3. **Check gcli2api logs**: Console output or configured log file
+4. **Trace bypass**: Search logs for "nativeFormat" or add `console.log` to `h0` function
 
 ---
 

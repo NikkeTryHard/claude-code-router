@@ -222,6 +222,10 @@ export const router = async (req: any, _res: any, context: any) => {
       model = await getUseModel(req, tokenCount, config, lastMessageUsage);
     }
     req.body.model = model;
+    // Set provider from model name for nativeFormat bypass logic
+    if (model && model.includes(',')) {
+      req.provider = model.split(',')[0];
+    }
   } catch (error: any) {
     req.log.error(`Error in router middleware: ${error.message}`);
     req.body.model = config.Router!.default;
