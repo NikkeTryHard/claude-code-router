@@ -81,6 +81,10 @@ class AnthropicPassthroughTransformer {
     // Check if thinking is enabled in the request
     const thinkingEnabled = body.thinking && body.thinking.type === 'enabled';
 
+    // DEBUG: Log thinking state
+    this.log('info', `[${ts}] [Anthropic-Passthrough] body.thinking = ${JSON.stringify(body.thinking)}`);
+    this.log('info', `[${ts}] [Anthropic-Passthrough] thinkingEnabled = ${thinkingEnabled}`);
+
     if (thinkingEnabled) {
       // Thinking is ENABLED: preserve native thinking blocks as-is
       // The Anthropic API expects actual 'thinking' type content blocks
