@@ -791,7 +791,11 @@ if (thinkingEnabled) {
 }
 ```
 
+> [!NOTE]
+> For providers with `nativeFormat: true` (like gcli2api), thinking block handling is done **in gcli2api itself**, not in the CCR transformer. gcli2api converts ALL thinking blocks with signatures to XML text, since Claude signatures are invalid for Gemini/Antigravity API. See the [gcli2api README](https://github.com/NikkeTryHard/gcli2api#thinking-block-to-xml-conversion) for details.
+
 ---
+
 
 ### Complete Configuration Example
 
