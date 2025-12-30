@@ -101,7 +101,6 @@
     "name_required": "名称为必填项",
     "name_duplicate": "已存在同名供应商",
     "search": "搜索供应商..."
-
   },
   "router": {
     "title": "路由",
@@ -232,6 +231,30 @@
     "worker_error": "Worker错误",
     "worker_init_failed": "Worker初始化失败",
     "grouping_not_supported": "服务器不支持日志分组",
-    "back": "返回"
+    "back": "返回",
+    "copy": "复制",
+    "copied": "已复制到剪贴板",
+    "copied_multiple": "已复制 {{count}} 个分组到剪贴板",
+    "copy_failed": "复制失败",
+    "select_all": "全选",
+    "deselect_all": "取消全选",
+    "copy_selected": "复制选中",
+    "sort_newest": "最新优先",
+    "sort_oldest": "最早优先",
+    "sort_duration": "按耗时排序",
+    "sort_status": "按状态排序（错误优先）",
+    "filter_endpoint": "筛选接口",
+    "clear_filter": "清除筛选",
+    "truncate_on": "已截断",
+    "truncate_off": "完整内容",
+    "view_gcli2api_logs": "查看 GCLI2API 日志",
+    "gcli2api_not_configured": "GCLI2API 集成未配置",
+    "gcli2api_fetch_failed": "获取 GCLI2API 日志失败",
+    "gcli2api_logs_title": "GCLI2API 日志",
+    "no_gcli2api_logs": "在 GCLI2API 中未找到匹配的日志",
+    "gcli2api_loading": "正在加载 GCLI2API 日志...",
+    "side_by_side_title": "日志对比",
+    "view_raw_logs": "查看原始日志",
+    "view_grouped_logs": "查看分组日志"
   }
 }

@@ -101,7 +101,6 @@
     "name_required": "Name is required",
     "name_duplicate": "A provider with this name already exists",
     "search": "Search providers..."
-
   },
   "router": {
     "title": "Router",
@@ -232,6 +231,30 @@
     "worker_error": "Worker error",
     "worker_init_failed": "Failed to initialize worker",
     "grouping_not_supported": "Log grouping not supported by server",
-    "back": "Back"
+    "back": "Back",
+    "copy": "Copy",
+    "copied": "Copied to clipboard",
+    "copied_multiple": "Copied {{count}} groups to clipboard",
+    "copy_failed": "Failed to copy",
+    "select_all": "Select All",
+    "deselect_all": "Deselect All",
+    "copy_selected": "Copy Selected",
+    "sort_newest": "Newest First",
+    "sort_oldest": "Oldest First",
+    "sort_duration": "By Duration",
+    "sort_status": "By Status (Errors First)",
+    "filter_endpoint": "Filter Endpoint",
+    "clear_filter": "Clear Filter",
+    "truncate_on": "Truncated",
+    "truncate_off": "Full Content",
+    "view_gcli2api_logs": "View GCLI2API Logs",
+    "gcli2api_not_configured": "GCLI2API integration not configured",
+    "gcli2api_fetch_failed": "Failed to fetch GCLI2API logs",
+    "gcli2api_logs_title": "GCLI2API Logs",
+    "no_gcli2api_logs": "No matching logs found in GCLI2API",
+    "gcli2api_loading": "Loading GCLI2API logs...",
+    "side_by_side_title": "Log Comparison",
+    "view_raw_logs": "View Raw Logs",
+    "view_grouped_logs": "View Grouped Logs"
   }
 }

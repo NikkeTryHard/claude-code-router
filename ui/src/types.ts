@@ -12,20 +12,20 @@ export interface Provider {
 }
 
 export interface RouterConfig {
-    default: string;
-    background: string;
-    think: string;
-    longContext: string;
-    longContextThreshold: number;
-    webSearch: string;
-    image: string;
-    custom?: any;
+  default: string;
+  background: string;
+  think: string;
+  longContext: string;
+  longContextThreshold: number;
+  webSearch: string;
+  image: string;
+  custom?: any;
 }
 
 export interface Transformer {
-    name?: string;
-    path: string;
-    options?: Record<string, any>;
+  name?: string;
+  path: string;
+  options?: Record<string, any>;
 }
 
 export interface StatusLineModuleConfig {
@@ -65,6 +65,13 @@ export interface Config {
   API_TIMEOUT_MS: string;
   PROXY_URL: string;
   CUSTOM_ROUTER_PATH?: string;
+  // GCli2API Integration for cross-application log correlation
+  gcli2api?: {
+    url: string;      // e.g., "http://localhost:7861"
+    token: string;    // Panel password for auth
+    enabled: boolean; // Feature toggle
+  };
 }
+
 
 export type AccessLevel = 'restricted' | 'full';

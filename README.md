@@ -940,9 +940,40 @@ data: {"type":"message_stop"}
 {"API_TIMEOUT_MS": 600000}
 ```
 
+### GCli2API Log Integration
+
+This fork adds cross-application log correlation between CCR and gcli2api for easier debugging.
+
+#### Features
+
+- **Request ID Passthrough**: CCR sends `X-Request-ID` header to gcli2api, enabling log correlation
+- **Side-by-Side Log Comparison**: LogViewer UI shows CCR and gcli2api logs together
+- **Log Query API**: Fetch gcli2api logs by request ID from CCR's UI
+
+#### Configuration
+
+Add to your `config.json`:
+
+```json
+{
+  "gcli2api": {
+    "url": "http://127.0.0.1:7861",
+    "token": "your-api-password",
+    "enabled": true
+  }
+}
+```
+
+#### Usage
+
+1. Open CCR LogViewer (`ccr ui` → Logs tab)
+2. Click "GCLI2API Logs" button on any request row
+3. View side-by-side comparison of CCR and gcli2api logs
+
 ---
 
 ### Future Development Plans
+
 
 #### Short-Term (Fix as Issues Arise)
 - [ ] Handle edge cases in thinking block format differences
