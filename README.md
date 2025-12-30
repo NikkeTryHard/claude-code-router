@@ -1043,10 +1043,51 @@ All compiled into `dist/cli.js`:
 
 1. **Enable debug logging**: Set `LOG_LEVEL: "debug"` in config
 2. **Check CCR logs**: `~/.claude-code-router/logs/ccr-*.log`
-3. **Check gcli2api logs**: Console output or configured log file
+3. **Check gcli2api logs**: Console output or `log.txt` in gcli2api directory
 4. **Trace bypass**: Search logs for "nativeFormat" or add `console.log` to `h0` function
 
+#### Testing with gcli2api
+
+```powershell
+# Test thinking block handling through the full pipeline
+$body = @{
+    model = "claude-opus-4-5"
+    max_tokens = 100
+    thinking = $null  # Test disabled thinking with history blocks
+    messages = @(
+        @{role="user"; content="Hi"},
+        @{role="assistant"; content=@(
+            @{type="thinking"; thinking="Previous thought"; signature="sig-123"},
+            @{type="text"; text="Hello!"}
+        )},
+        @{role="user"; content="Continue"}
+    )
+} | ConvertTo-Json -Depth 10
+
+# Through CCR (port 3456) -> gcli2api (port 7861)
+Invoke-RestMethod -Uri "http://127.0.0.1:3456/v1/messages" -Method POST `
+    -Headers @{"x-api-key"="test"} -Body $body -ContentType "application/json"
+```
+
+#### Common Integration Issues
+
+| Issue | Symptom | Solution |
+|-------|---------|----------|
+| Transformer not called | No transformer logs | Check `nativeFormat: true` bypasses transformers - fix is in gcli2api |
+| 400 thinking blocks error | "assistant message cannot contain thinking blocks" | Update gcli2api to convert thinking to XML |
+| 500 provider error | gcli2api returns 500 | Check gcli2api logs for actual upstream error |
+| Empty response | Stream ends without content | Enable debug logging, check for bypass issues |
+
+#### Log Correlation
+
+CCR passes `X-Request-ID` to gcli2api for log correlation:
+
+1. Find request ID in CCR logs: `grep "reqId" ~/.claude-code-router/logs/ccr-*.log`
+2. Search gcli2api logs for same ID: `Select-String -Path log.txt -Pattern "req-xyz"`
+3. Use LogViewer UI for side-by-side comparison
+
 ---
+
 
 ## ❤️ Support & Sponsoring
 
