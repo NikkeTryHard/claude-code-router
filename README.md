@@ -9,14 +9,6 @@
 
 ---
 
-![](blog/images/sponsors/glm-en.jpg)
-
-> This project is sponsored by Z.ai, supporting us with their GLM CODING PLAN.
-> GLM CODING PLAN is a subscription service designed for AI coding, starting at just $3/month. It provides access to their flagship GLM-4.7 model across 10+ popular AI coding tools (Claude Code, Cline, Roo Code, etc.), offering developers top-tier, fast, and stable coding experiences.
-> Get 10% OFF GLM CODING PLAN: https://z.ai/subscribe?ic=8JVLJQFSKB
-
----
-
 > A powerful routing proxy that enables Claude Code to work with any LLM provider. Route requests dynamically based on context, token count, task type, and custom logic.
 
 ![Claude Code in Action](blog/images/claude-code.png)
@@ -24,31 +16,39 @@
 ## Table of Contents
 
 - [Overview](#overview)
-- [Architecture](#architecture)
-- [Features](#features)
+- [Technical Architecture](#technical-architecture)
+- [Core Features](#core-features)
 - [Installation](#installation)
-- [Configuration](#configuration)
-- [CLI Commands](#cli-commands)
-- [Routing System](#routing-system)
-- [Transformers](#transformers)
+- [Configuration Reference](#configuration-reference)
+- [CLI Command Reference](#cli-command-reference)
+- [Routing System Deep Dive](#routing-system-deep-dive)
+- [Transformer System](#transformer-system)
 - [Agent System](#agent-system)
-- [Web UI](#web-ui)
-- [GitHub Actions Integration](#github-actions-integration)
 - [Advanced Features](#advanced-features)
 - [Troubleshooting](#troubleshooting)
 - [Further Reading](#further-reading)
 - [Support & Sponsoring](#support--sponsoring)
 
+---
+
 ## Overview
 
-Claude Code Router is a TypeScript-based proxy server that intercepts requests from Claude Code and routes them to different LLM providers based on configurable rules. This enables:
+Claude Code Router is a TypeScript-based proxy server built on [Fastify](https://fastify.io/) (via the `@musistudio/llms` library) that intercepts requests from Claude Code and routes them to different LLM providers based on configurable rules. The router operates as a transparent middleware layer, accepting Anthropic API format requests and transforming them for various upstream providers.
 
-- **Cost Optimization**: Use cheaper models for background tasks, premium models for complex reasoning
-- **Provider Flexibility**: Switch between OpenRouter, DeepSeek, Gemini, Ollama, and many more
-- **Context-Aware Routing**: Automatically select models based on token count, task type, or custom logic
-- **Seamless Integration**: Works transparently with Claude Code without any modifications
+### Key Capabilities
 
-## Architecture
+| Capability                | Description                                                                                        | Implementation                                             |
+| ------------------------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **Cost Optimization**     | Route background/simple tasks to cheaper models, reserve premium models for complex reasoning      | Automatic haiku detection routes to `background` model     |
+| **Provider Flexibility**  | Switch between OpenRouter, DeepSeek, Gemini, Ollama, Volcengine, SiliconFlow, and custom providers | Provider configuration in `config.json`                    |
+| **Context-Aware Routing** | Automatically select models based on token count, task type, or custom logic                       | Token counting via `tiktoken` with configurable thresholds |
+| **Seamless Integration**  | Works transparently with Claude Code without any modifications                                     | Environment variable injection via `ccr activate`          |
+
+---
+
+## Technical Architecture
+
+### System Component Diagram
 
 ```mermaid
 flowchart TB
@@ -58,16 +58,38 @@ flowchart TB
 
     subgraph Router["Claude Code Router :3456"]
         direction TB
-        Auth[Authentication Middleware]
-        TokenCalc[Token Calculator]
-        RouterLogic[Router Logic]
-        Transformer[Request/Response Transformer]
-        AgentSystem[Agent System]
 
-        Auth --> TokenCalc
+        subgraph Middleware["Middleware Layer"]
+            Auth["Authentication<br/><code>src/middleware/auth.ts</code>"]
+            Trace["Trace Logger<br/><code>src/middleware/trace.ts</code>"]
+        end
+
+        subgraph Core["Core Processing"]
+            TokenCalc["Token Calculator<br/><code>src/utils/router.ts:16-68</code><br/>tiktoken cl100k_base"]
+            RouterLogic["Router Logic<br/><code>src/utils/router.ts:106-180</code>"]
+            CustomRouter["Custom Router<br/><code>config.CUSTOM_ROUTER_PATH</code>"]
+        end
+
+        subgraph Agents["Agent System"]
+            AgentMgr["Agent Manager<br/><code>src/agents/index.ts</code>"]
+            ImageAgent["Image Agent<br/><code>src/agents/image.agent.ts</code>"]
+        end
+
+        subgraph Stream["Stream Processing"]
+            SSEParser["SSE Parser<br/><code>src/utils/SSEParser.transform.ts</code>"]
+            SSESerializer["SSE Serializer<br/><code>src/utils/SSESerializer.transform.ts</code>"]
+            RewriteStream["Stream Rewriter<br/><code>src/utils/rewriteStream.ts</code>"]
+        end
+
+        Auth --> Trace
+        Trace --> TokenCalc
         TokenCalc --> RouterLogic
-        RouterLogic --> Transformer
-        Transformer --> AgentSystem
+        RouterLogic --> CustomRouter
+        CustomRouter --> AgentMgr
+        AgentMgr --> ImageAgent
+        ImageAgent --> SSEParser
+        SSEParser --> RewriteStream
+        RewriteStream --> SSESerializer
     end
 
     subgraph Providers["LLM Providers"]
@@ -81,69 +103,169 @@ flowchart TB
         Others[Other Providers...]
     end
 
-    CC -->|"Anthropic API Format"| Auth
-    AgentSystem --> OpenRouter
-    AgentSystem --> DeepSeek
-    AgentSystem --> Gemini
-    AgentSystem --> Ollama
-    AgentSystem --> Volcengine
-    AgentSystem --> SiliconFlow
-    AgentSystem --> Others
+    CC -->|"POST /v1/messages<br/>Anthropic API Format"| Auth
+    SSESerializer --> OpenRouter
+    SSESerializer --> DeepSeek
+    SSESerializer --> Gemini
+    SSESerializer --> Ollama
+    SSESerializer --> Volcengine
+    SSESerializer --> SiliconFlow
+    SSESerializer --> Others
 ```
 
-### Request Flow
+### Detailed Request Flow
 
 ```mermaid
 sequenceDiagram
+    autonumber
     participant CC as Claude Code
-    participant CCR as Claude Code Router
+    participant Auth as Auth Middleware
+    participant Trace as Trace Logger
+    participant Agents as Agent Manager
+    participant Router as Router Logic
+    participant Transform as Transformer
     participant Provider as LLM Provider
+    participant Stream as Stream Processor
 
-    CC->>CCR: POST /v1/messages
-    CCR->>CCR: Authenticate request
-    CCR->>CCR: Calculate token count
-    CCR->>CCR: Apply routing rules
-    CCR->>CCR: Transform request format
-    CCR->>Provider: Forward transformed request
-    Provider-->>CCR: Stream/Response
-    CCR->>CCR: Transform response format
-    CCR-->>CC: Anthropic-compatible response
+    CC->>Auth: POST /v1/messages
+    Note over Auth: Validate Authorization header<br/>or x-api-key header
+
+    Auth->>Trace: Request authenticated
+    Note over Trace: Log incoming request<br/>(if TRACE_MODE enabled)
+
+    Trace->>Agents: Check agent handlers
+    Note over Agents: ImageAgent.shouldHandle()<br/>Detect images, inject tools
+
+    Agents->>Router: Process routing
+    Note over Router: 1. Check custom router<br/>2. Calculate token count<br/>3. Apply routing rules<br/>4. Select provider,model
+
+    Router->>Transform: Transform request
+    Note over Transform: Convert Anthropic format<br/>to provider-specific format
+
+    Transform->>Provider: Forward request
+    Provider-->>Stream: SSE Stream / Response
+
+    Note over Stream: Parse SSE events<br/>Extract thinking blocks<br/>Handle agent tool calls
+
+    alt Agent Tool Call Detected
+        Stream->>Agents: Execute tool (e.g., analyzeImage)
+        Agents->>Provider: Recursive request to vision model
+        Provider-->>Agents: Tool result
+        Agents-->>Stream: Inject tool result
+    end
+
+    Stream-->>CC: Anthropic-compatible SSE response
 ```
 
-## Features
+### File Structure Overview
 
-### Core Features
+```
+src/
+├── index.ts              # Server entry point, hook registration
+├── cli.ts                # CLI command handler
+├── server.ts             # Fastify server configuration
+├── constants.ts          # Path constants (HOME_DIR, CONFIG_FILE, PID_FILE)
+├── middleware/
+│   ├── auth.ts           # API key authentication
+│   └── trace.ts          # Request/response tracing
+├── agents/
+│   ├── index.ts          # AgentsManager class
+│   ├── type.ts           # IAgent, ITool interfaces
+│   └── image.agent.ts    # Image analysis agent
+└── utils/
+    ├── router.ts         # Core routing logic, token counting
+    ├── modelSelector.ts  # Interactive model configuration
+    ├── SSEParser.transform.ts    # SSE stream parser
+    ├── SSESerializer.transform.ts # SSE stream serializer
+    ├── rewriteStream.ts  # Stream interception and rewriting
+    ├── cache.ts          # LRU cache for session usage
+    ├── replay.ts         # Failed request replay storage
+    ├── statusline.ts     # Terminal status line rendering
+    ├── activateCommand.ts # Environment variable generation
+    ├── codeCommand.ts    # Claude CLI execution wrapper
+    └── createEnvVariables.ts # Environment variable builder
+```
 
-| Feature                             | Description                                                                         |
-| ----------------------------------- | ----------------------------------------------------------------------------------- |
-| **Model Routing**                   | Route requests to different models based on task type, token count, or custom rules |
-| **Multi-Provider Support**          | OpenRouter, DeepSeek, Ollama, Gemini, Volcengine, SiliconFlow, and more             |
-| **Request/Response Transformation** | Automatic format conversion between Anthropic and provider-specific APIs            |
-| **Dynamic Model Switching**         | Switch models on-the-fly using `/model` command in Claude Code                      |
-| **CLI Model Management**            | Interactive terminal-based model configuration with `ccr model`                     |
-| **Web UI**                          | Browser-based configuration interface                                               |
-| **Status Line**                     | Real-time status display integration                                                |
-| **Trace Mode**                      | Detailed request/response logging for debugging                                     |
-| **Replay System**                   | Save and replay failed requests for debugging                                       |
-| **Agent System**                    | Built-in agents for specialized tasks (e.g., image analysis)                        |
-| **GitHub Actions**                  | CI/CD integration for automated workflows                                           |
+---
+
+## Core Features
+
+### Feature Implementation Matrix
+
+| Feature                             | Status      | Primary Implementation             | Description                                                     |
+| ----------------------------------- | ----------- | ---------------------------------- | --------------------------------------------------------------- |
+| **Model Routing**                   | Implemented | `src/utils/router.ts:106-180`      | Routes requests based on task type, token count, custom rules   |
+| **Multi-Provider Support**          | Implemented | `src/utils/modelSelector.ts:20-26` | OpenRouter, DeepSeek, Ollama, Gemini, Volcengine, SiliconFlow   |
+| **Request/Response Transformation** | Implemented | `@musistudio/llms` dependency      | Automatic format conversion between Anthropic and provider APIs |
+| **Dynamic Model Switching**         | Implemented | `src/utils/router.ts:115-127`      | `/model provider,model` command parsing                         |
+| **CLI Model Management**            | Implemented | `src/utils/modelSelector.ts`       | Interactive TUI using `@inquirer/prompts`                       |
+| **Web UI**                          | Implemented | `src/server.ts:65-74`              | Static file serving from `dist` directory                       |
+| **Status Line**                     | Implemented | `src/utils/statusline.ts`          | Powerline-compatible terminal status                            |
+| **Trace Mode**                      | Implemented | `src/middleware/trace.ts`          | Detailed request/response logging                               |
+| **Replay System**                   | Implemented | `src/utils/replay.ts`              | Save and replay failed requests                                 |
+| **Agent System**                    | Implemented | `src/agents/`                      | Extensible agent framework with ImageAgent                      |
+| **GitHub Actions**                  | Supported   | `src/utils/codeCommand.ts:30-35`   | `NON_INTERACTIVE_MODE` for CI/CD                                |
 
 ### Routing Scenarios
 
-| Route Type    | Use Case                          | Example Model                              |
-| ------------- | --------------------------------- | ------------------------------------------ |
-| `default`     | General tasks                     | `deepseek,deepseek-chat`                   |
-| `background`  | Background/haiku tasks            | `ollama,qwen2.5-coder:latest`              |
-| `think`       | Reasoning-heavy tasks (Plan Mode) | `deepseek,deepseek-reasoner`               |
-| `longContext` | Large context (>60K tokens)       | `openrouter,google/gemini-2.5-pro-preview` |
-| `webSearch`   | Web search enabled tasks          | `gemini,gemini-2.5-flash`                  |
-| `image`       | Image analysis tasks              | `openrouter,anthropic/claude-sonnet-4`     |
+```mermaid
+flowchart TD
+    Request[Incoming Request] --> CustomCheck{Custom Router<br/>Configured?}
+
+    CustomCheck -->|Yes| CustomRouter[Execute Custom Router]
+    CustomRouter -->|Returns model| Done[Route to Model]
+    CustomRouter -->|Returns null| ManualCheck
+
+    CustomCheck -->|No| ManualCheck{Manual Override?<br/>model contains comma}
+
+    ManualCheck -->|Yes| ParseManual[Parse provider,model]
+    ParseManual --> Done
+
+    ManualCheck -->|No| TokenCheck{Token Count ><br/>longContextThreshold?}
+
+    TokenCheck -->|Yes| LongContext[Use longContext model]
+    LongContext --> Done
+
+    TokenCheck -->|No| SubagentCheck{CCR-SUBAGENT-MODEL<br/>tag present?}
+
+    SubagentCheck -->|Yes| SubagentModel[Extract subagent model]
+    SubagentModel --> Done
+
+    SubagentCheck -->|No| HaikuCheck{Model contains<br/>'claude' AND 'haiku'?}
+
+    HaikuCheck -->|Yes| Background[Use background model]
+    Background --> Done
+
+    HaikuCheck -->|No| WebSearchCheck{Tools contain<br/>web_search?}
+
+    WebSearchCheck -->|Yes| WebSearch[Use webSearch model]
+    WebSearch --> Done
+
+    WebSearchCheck -->|No| ThinkCheck{thinking<br/>enabled?}
+
+    ThinkCheck -->|Yes| Think[Use think model]
+    Think --> Done
+
+    ThinkCheck -->|No| Default[Use default model]
+    Default --> Done
+```
+
+| Route Type    | Trigger Condition                                      | Implementation Location            | Example Configuration                        |
+| ------------- | ------------------------------------------------------ | ---------------------------------- | -------------------------------------------- |
+| `default`     | No other conditions match                              | `src/utils/router.ts:179`          | `"deepseek,deepseek-chat"`                   |
+| `background`  | Model name contains "claude" AND "haiku"               | `src/utils/router.ts:157-165`      | `"ollama,qwen2.5-coder:latest"`              |
+| `think`       | `req.body.thinking` is truthy                          | `src/utils/router.ts:175-178`      | `"deepseek,deepseek-reasoner"`               |
+| `longContext` | Token count > `longContextThreshold` (default: 60000)  | `src/utils/router.ts:129-141`      | `"openrouter,google/gemini-2.5-pro-preview"` |
+| `webSearch`   | Tools array contains `type` starting with `web_search` | `src/utils/router.ts:167-172`      | `"gemini,gemini-2.5-flash"`                  |
+| `image`       | Messages contain image content                         | `src/agents/image.agent.ts:58-101` | `"openrouter,anthropic/claude-sonnet-4"`     |
+
+---
 
 ## Installation
 
 ### Prerequisites
 
-- Node.js 18+ or Bun
+- **Node.js 18+** (required by Fastify ^5.4.0 dependency) or **Bun**
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code/quickstart) installed
 
 ### Install Claude Code
@@ -171,13 +293,29 @@ bun add -g @musistudio/claude-code-router
 ccr --version
 ```
 
-## Configuration
+### Package Details
+
+| Field               | Value                                       |
+| ------------------- | ------------------------------------------- |
+| Package Name        | `@musistudio/claude-code-router`            |
+| Binary Command      | `ccr` (mapped to `dist/cli.js`)             |
+| Node.js Requirement | >= 18.0.0 (implicit via Fastify dependency) |
+
+---
+
+## Configuration Reference
 
 ### Configuration File Location
 
-Configuration is stored at `~/.claude-code-router/config.json`. For more details, refer to `config.example.json`.
+Configuration is stored at `~/.claude-code-router/config.json` (defined in `src/constants.ts:6`).
 
-### Configuration Schema
+```typescript
+// src/constants.ts
+export const HOME_DIR = path.join(os.homedir(), ".claude-code-router");
+export const CONFIG_FILE = path.join(HOME_DIR, "config.json");
+```
+
+### Complete Configuration Schema
 
 ```json
 {
@@ -200,36 +338,64 @@ Configuration is stored at `~/.claude-code-router/config.json`. For more details
 }
 ```
 
-### Configuration Options
+### Configuration Options Reference
 
-| Option                  | Type    | Default     | Description                                                                                                                                                  |
-| ----------------------- | ------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `PORT`                  | number  | `3456`      | Server port                                                                                                                                                  |
-| `HOST`                  | string  | `127.0.0.1` | Server host (forced to 127.0.0.1 if APIKEY not set)                                                                                                          |
-| `APIKEY`                | string  | -           | API key for authentication. When set, clients must provide this key in the `Authorization` header (e.g., `Bearer your-secret-key`) or the `x-api-key` header |
-| `PROXY_URL`             | string  | -           | HTTP proxy for API requests                                                                                                                                  |
-| `LOG`                   | boolean | `true`      | Enable logging. When set to `false`, no log files will be created                                                                                            |
-| `LOG_LEVEL`             | string  | `debug`     | Log level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`                                                                                                |
-| `API_TIMEOUT_MS`        | number  | `600000`    | API call timeout in milliseconds                                                                                                                             |
-| `NON_INTERACTIVE_MODE`  | boolean | `false`     | Enable for CI/CD environments. Sets `CI=true`, `FORCE_COLOR=0`, etc.                                                                                         |
-| `TRACE_MODE`            | boolean | `false`     | Enable detailed request tracing                                                                                                                              |
-| `TRACE_INCLUDE_BODIES`  | boolean | `false`     | Include request/response bodies in traces                                                                                                                    |
-| `CUSTOM_ROUTER_PATH`    | string  | -           | Path to custom router JavaScript file                                                                                                                        |
-| `REWRITE_SYSTEM_PROMPT` | string  | -           | Path to custom system prompt file                                                                                                                            |
-| `forceUseImageAgent`    | boolean | `false`     | Force image agent for non-tool-calling models                                                                                                                |
+| Option                  | Type    | Default     | Source Location                      | Description                                                                  |
+| ----------------------- | ------- | ----------- | ------------------------------------ | ---------------------------------------------------------------------------- |
+| `PORT`                  | number  | `3456`      | `src/index.ts:79`                    | Server listening port                                                        |
+| `HOST`                  | string  | `127.0.0.1` | `src/index.ts:72`                    | Server bind address (forced to 127.0.0.1 if APIKEY not set)                  |
+| `APIKEY`                | string  | -           | `src/middleware/auth.ts:11`          | API key for authentication via `Authorization: Bearer` or `x-api-key` header |
+| `PROXY_URL`             | string  | -           | -                                    | HTTP proxy for outbound API requests                                         |
+| `LOG`                   | boolean | `true`      | `src/index.ts:117`                   | Enable/disable file logging                                                  |
+| `LOG_LEVEL`             | string  | `debug`     | `src/index.ts:119`                   | Pino log level: `fatal`, `error`, `warn`, `info`, `debug`, `trace`           |
+| `API_TIMEOUT_MS`        | number  | `600000`    | `src/utils/createEnvVariables.ts:19` | API call timeout in milliseconds (10 minutes default)                        |
+| `NON_INTERACTIVE_MODE`  | boolean | `false`     | `src/utils/codeCommand.ts:30`        | CI/CD mode: sets `CI=true`, `TERM=dumb`, `FORCE_COLOR=0`                     |
+| `TRACE_MODE`            | boolean | `false`     | `src/middleware/trace.ts:55`         | Enable detailed request tracing                                              |
+| `TRACE_INCLUDE_BODIES`  | boolean | `false`     | `src/middleware/trace.ts:62`         | Include full request/response bodies in traces                               |
+| `CUSTOM_ROUTER_PATH`    | string  | -           | `src/utils/router.ts:210`            | Path to custom router JavaScript module                                      |
+| `REWRITE_SYSTEM_PROMPT` | string  | -           | `src/utils/router.ts:194`            | Path to custom system prompt file                                            |
+| `forceUseImageAgent`    | boolean | `false`     | `src/agents/image.agent.ts:63`       | Force agent workflow for images (vs direct routing)                          |
 
-### Logging System
+### Logging System Architecture
 
-Claude Code Router uses two separate logging systems:
+```mermaid
+flowchart LR
+    subgraph Server["Server Process"]
+        Pino["Pino Logger"]
+        AppLog["Application Logger"]
+    end
 
-| Log Type          | Location                                       | Content                                        |
-| ----------------- | ---------------------------------------------- | ---------------------------------------------- |
-| Server-level      | `~/.claude-code-router/logs/ccr-*.log`         | HTTP requests, API calls, server events (pino) |
-| Application-level | `~/.claude-code-router/claude-code-router.log` | Routing decisions, business logic              |
+    subgraph Files["Log Files"]
+        RotatingLog["~/.claude-code-router/logs/ccr-*.log<br/>(Rotating, timestamped)"]
+        AppLogFile["~/.claude-code-router/claude-code-router.log<br/>(Application events)"]
+    end
+
+    Pino -->|"HTTP requests<br/>API calls<br/>Server events"| RotatingLog
+    AppLog -->|"Routing decisions<br/>Business logic"| AppLogFile
+```
+
+| Log Type          | Location                                       | Content                                 | Implementation                                      |
+| ----------------- | ---------------------------------------------- | --------------------------------------- | --------------------------------------------------- |
+| Server-level      | `~/.claude-code-router/logs/ccr-*.log`         | HTTP requests, API calls, server events | Pino with rotating-file-stream (`src/index.ts:114`) |
+| Application-level | `~/.claude-code-router/claude-code-router.log` | Routing decisions, business logic       | `src/index.ts:137-140`                              |
 
 ### Environment Variable Interpolation
 
-Reference environment variables in config using `$VAR_NAME` or `${VAR_NAME}`:
+The configuration system supports environment variable interpolation using `$VAR_NAME` or `${VAR_NAME}` syntax.
+
+**Implementation:** `src/utils/index.ts:14-20`
+
+```typescript
+const interpolateEnvVars = (obj: any): any => {
+  // ...
+  return obj.replace(/\$\{([^}]+)\}|\$([A-Z_][A-Z0-9_]*)/g, (match, braced, unbraced) => {
+    const varName = braced || unbraced;
+    return process.env[varName] || match; // Keep original if env var doesn't exist
+  });
+};
+```
+
+**Example Configuration:**
 
 ```json
 {
@@ -240,25 +406,15 @@ Reference environment variables in config using `$VAR_NAME` or `${VAR_NAME}`:
       "name": "openai",
       "api_base_url": "https://api.openai.com/v1/chat/completions",
       "api_key": "$OPENAI_API_KEY",
-      "models": ["gpt-5", "gpt-5-mini"]
+      "models": ["gpt-4o", "gpt-4o-mini"]
     }
   ]
 }
 ```
 
-This allows you to keep sensitive API keys in environment variables instead of hardcoding them in configuration files. The interpolation works recursively through nested objects and arrays.
-
 ### Provider Configuration
 
-The `Providers` array defines the different model providers you want to use. Each provider object requires:
-
-- `name`: A unique name for the provider
-- `api_base_url`: The full API endpoint for chat completions
-- `api_key`: Your API key for the provider
-- `models`: A list of model names available from this provider
-- `transformer` (optional): Specifies transformers to process requests and responses
-
-**Example Configuration:**
+The `Providers` array defines LLM provider connections:
 
 ```json
 {
@@ -267,12 +423,7 @@ The `Providers` array defines the different model providers you want to use. Eac
       "name": "openrouter",
       "api_base_url": "https://openrouter.ai/api/v1/chat/completions",
       "api_key": "sk-xxx",
-      "models": [
-        "google/gemini-2.5-pro-preview",
-        "anthropic/claude-sonnet-4",
-        "anthropic/claude-3.5-sonnet",
-        "anthropic/claude-3.7-sonnet:thinking"
-      ],
+      "models": ["google/gemini-2.5-pro-preview", "anthropic/claude-sonnet-4", "anthropic/claude-3.5-sonnet"],
       "transformer": {
         "use": ["openrouter"]
       }
@@ -303,23 +454,12 @@ The `Providers` array defines the different model providers you want to use. Eac
       "transformer": {
         "use": ["gemini"]
       }
-    },
-    {
-      "name": "volcengine",
-      "api_base_url": "https://ark.cn-beijing.volces.com/api/v3/chat/completions",
-      "api_key": "sk-xxx",
-      "models": ["deepseek-v3-250324", "deepseek-r1-250528"],
-      "transformer": {
-        "use": ["deepseek"]
-      }
     }
   ]
 }
 ```
 
 ### Router Configuration
-
-The `Router` object defines which model to use for different scenarios:
 
 ```json
 {
@@ -335,19 +475,11 @@ The `Router` object defines which model to use for different scenarios:
 }
 ```
 
-| Route                  | Description                                                                              |
-| ---------------------- | ---------------------------------------------------------------------------------------- |
-| `default`              | Default model for general tasks                                                          |
-| `background`           | Model for background tasks (can be smaller/local to save costs)                          |
-| `think`                | Model for reasoning-heavy tasks like Plan Mode                                           |
-| `longContext`          | Model for handling long contexts (e.g., >60K tokens)                                     |
-| `longContextThreshold` | Token count threshold for triggering long context model (default: 60000)                 |
-| `webSearch`            | Model for web search tasks (requires model support; add `:online` suffix for OpenRouter) |
-| `image`                | Model for image-related tasks (beta, uses built-in agent)                                |
+---
 
-## CLI Commands
+## CLI Command Reference
 
-### Command Reference
+### Command Overview
 
 ```
 Usage: ccr [command]
@@ -367,74 +499,41 @@ Commands:
   -h, help      Show help information
 ```
 
-### Starting the Router
+### Command Implementation Details
 
-```shell
-# Start the server
-ccr start
-
-# Run Claude Code through the router
-ccr code
-
-# Run with a specific prompt
-ccr code "Write a Hello World in Python"
-```
-
-> **Note**: After modifying the configuration file, restart the service:
->
-> ```shell
-> ccr restart
-> ```
-
-### Model Management
-
-```shell
-# Interactive model selector
-ccr model
-```
-
-![Model Selector](blog/images/models.gif)
-
-The interactive CLI allows you to:
-
-- View current configuration
-- See all configured models (default, background, think, longContext, webSearch, image)
-- Switch models for each router type
-- Add new models to existing providers
-- Create new provider configurations with transformer support
+| Command      | Implementation                                        | Description                                                                   |
+| ------------ | ----------------------------------------------------- | ----------------------------------------------------------------------------- |
+| `start`      | `src/cli.ts:71-73` → `src/index.ts:run()`             | Initializes config, directories, starts Fastify server, writes PID file       |
+| `stop`       | `src/cli.ts:74-95`                                    | Reads PID from `~/.claude-code-router/.claude-code-router.pid`, kills process |
+| `restart`    | `src/cli.ts:296-330`                                  | Stops service, spawns new detached node process                               |
+| `status`     | `src/cli.ts:96-98` → `src/utils/status.ts`            | Displays PID, Port, API Endpoint, PID file location                           |
+| `statusline` | `src/cli.ts:99-120` → `src/utils/statusline.ts`       | Reads JSON from stdin, outputs formatted status string                        |
+| `code`       | `src/cli.ts:129-172` → `src/utils/codeCommand.ts`     | Auto-starts service if needed, spawns `claude` CLI with proxy env vars        |
+| `model`      | `src/cli.ts:122-124` → `src/utils/modelSelector.ts`   | Interactive TUI for model configuration using `@inquirer/prompts`             |
+| `activate`   | `src/cli.ts:125-128` → `src/utils/activateCommand.ts` | Outputs shell `export` statements                                             |
+| `ui`         | `src/cli.ts:173-291`                                  | Auto-starts service, opens `http://127.0.0.1:${port}/ui/` in browser          |
+| `replay`     | `src/cli.ts:331-334` → `src/utils/replayCommand.ts`   | Subcommands: `list`, `run`, `clear`, `stats`, `show`                          |
 
 ### Environment Activation
 
 ```shell
-# Set environment variables for current shell
 eval "$(ccr activate)"
-
-# Now use claude directly
-claude "Your prompt here"
 ```
 
-The `activate` command sets:
+**Generated Environment Variables** (from `src/utils/createEnvVariables.ts`):
 
-- `ANTHROPIC_AUTH_TOKEN`: API key from configuration
-- `ANTHROPIC_BASE_URL`: Router endpoint (default: `http://127.0.0.1:3456`)
-- `NO_PROXY`: Set to `127.0.0.1`
-- `DISABLE_TELEMETRY`: Disables telemetry
-- `DISABLE_COST_WARNINGS`: Disables cost warnings
-- `API_TIMEOUT_MS`: API timeout from configuration
+| Variable                  | Value                      | Purpose                         |
+| ------------------------- | -------------------------- | ------------------------------- |
+| `ANTHROPIC_AUTH_TOKEN`    | Config API key or "test"   | Authentication token            |
+| `ANTHROPIC_BASE_URL`      | `http://127.0.0.1:${port}` | Router endpoint                 |
+| `NO_PROXY`                | `127.0.0.1`                | Bypass proxy for local requests |
+| `DISABLE_TELEMETRY`       | `true`                     | Disable Claude telemetry        |
+| `DISABLE_COST_WARNINGS`   | `true`                     | Disable cost warning prompts    |
+| `API_TIMEOUT_MS`          | Config value or `600000`   | Request timeout                 |
+| `ANTHROPIC_API_KEY`       | (empty string)             | Clear any existing key          |
+| `CLAUDE_CODE_USE_BEDROCK` | (unset)                    | Disable Bedrock mode            |
 
-> **Note**: Make sure the Claude Code Router service is running (`ccr start`) before using the activated environment variables. To make them persistent, add `eval "$(ccr activate)"` to your shell configuration file (e.g., `~/.zshrc` or `~/.bashrc`).
-
-### Web UI
-
-```shell
-ccr ui
-```
-
-![Web UI](/blog/images/ui.png)
-
-This opens a web-based interface where you can easily view and edit your configuration.
-
-### Replay System
+### Replay System Commands
 
 ```shell
 # List saved replays
@@ -446,23 +545,67 @@ ccr replay run latest
 # Run a specific replay by ID
 ccr replay run <replay-id>
 
+# Show replay details
+ccr replay show <replay-id>
+
+# Show storage statistics
+ccr replay stats
+
 # Clear all replays
 ccr replay clear
 ```
 
-Replays are automatically saved when errors occur, enabling debugging of failed requests.
+Replays are stored in `~/.claude-code-router/replays/` and automatically saved when errors occur.
 
-## Routing System
+---
 
-### Automatic Routing
+## Routing System Deep Dive
 
-The router automatically selects models based on:
+### Routing Precedence Order
 
-1. **Token Count**: If tokens exceed `longContextThreshold`, use `longContext` model
-2. **Model Type**: Claude Haiku variants use `background` model
-3. **Web Search**: Requests with web search tools use `webSearch` model
-4. **Thinking Mode**: Requests with thinking enabled use `think` model
-5. **Subagent Routing**: Special tags in prompts for subagent model selection
+The router evaluates conditions in this exact order (first match wins):
+
+1. **Custom Router** - If `CUSTOM_ROUTER_PATH` configured and returns non-null
+2. **Manual Override** - If model string contains comma (e.g., `provider,model`)
+3. **Project-Specific Config** - Overrides from `~/.claude-code-router/<project>/config.json`
+4. **Long Context** - Token count exceeds `longContextThreshold`
+5. **Subagent Tag** - `<CCR-SUBAGENT-MODEL>` tag in system prompt
+6. **Background Model** - Model name contains "claude" AND "haiku"
+7. **Web Search** - Tools array contains `web_search` type
+8. **Thinking Model** - `req.body.thinking` is truthy
+9. **Default Model** - Fallback to `Router.default`
+
+### Token Counting Implementation
+
+**Location:** `src/utils/router.ts:16-68`
+
+```typescript
+import { get_encoding } from "tiktoken";
+const encoding = get_encoding("cl100k_base");
+
+export const calculateTokenCount = (body: any): number => {
+  let totalTokens = 0;
+
+  // Count system prompt tokens
+  if (body.system) {
+    // Handle string or array format
+    totalTokens += encoding.encode(systemText).length;
+  }
+
+  // Count message tokens
+  for (const message of body.messages || []) {
+    // Handle text and image content
+    totalTokens += encoding.encode(content).length;
+  }
+
+  // Count tool definitions
+  for (const tool of body.tools || []) {
+    totalTokens += encoding.encode(JSON.stringify(tool)).length;
+  }
+
+  return totalTokens;
+};
+```
 
 ### Manual Model Switching
 
@@ -472,24 +615,24 @@ In Claude Code, use the `/model` command:
 /model provider_name,model_name
 ```
 
-Example:
+**Implementation:** `src/utils/router.ts:115-127`
 
-```
-/model openrouter,anthropic/claude-3.5-sonnet
-```
+The router detects a comma in `req.body.model`, splits into `[provider, model]`, validates against configured providers, and returns the resolved model string.
 
 ### Subagent Routing
 
-Specify models for subagents by including a tag at the **beginning** of the prompt:
+Specify models for subagents by including a tag at the **beginning** of the system prompt:
 
 ```
 <CCR-SUBAGENT-MODEL>openrouter,anthropic/claude-3.5-sonnet</CCR-SUBAGENT-MODEL>
-Please help me analyze this code snippet for potential optimizations...
+Please help me analyze this code snippet...
 ```
 
-### Custom Router
+**Implementation:** `src/utils/router.ts:142-156`
 
-For advanced routing logic, create a custom router:
+The tag is detected, extracted, and removed from the prompt before forwarding to prevent leaking to the LLM.
+
+### Custom Router
 
 **config.json:**
 
@@ -527,18 +670,27 @@ module.exports = async function router(req, config, context) {
 };
 ```
 
+**Execution:** `src/utils/router.ts:210-220` - Custom router is `require()`d and executed **before** built-in routing logic.
+
 ### Project-Specific Configuration
 
-Create project-specific routing by placing configuration files in:
+**Location:** `src/utils/router.ts:80-104, 239-294`
 
-- `~/.claude-code-router/<project>/config.json` - Project-level config
-- `~/.claude-code-router/<project>/<session-id>.json` - Session-level config
+The router searches for project-specific configs based on session ID:
 
-## Transformers
+1. Extract `sessionId` from `req.body.metadata.user_id`
+2. Search `~/.claude/projects` for matching project directory
+3. Load config from:
+   - `~/.claude-code-router/<project>/<session-id>.json` (session-level)
+   - `~/.claude-code-router/<project>/config.json` (project-level)
 
-Transformers adapt request/response formats for different provider APIs.
+---
 
-### Transformer Configuration
+## Transformer System
+
+Transformers adapt request/response formats for different provider APIs. The actual transformation logic is implemented in the `@musistudio/llms` dependency.
+
+### Transformer Configuration Patterns
 
 **Global Transformer** - Apply to all models from a provider:
 
@@ -596,30 +748,19 @@ Transformers adapt request/response formats for different provider APIs.
 | Transformer     | Description                                                                                                     |
 | --------------- | --------------------------------------------------------------------------------------------------------------- |
 | `Anthropic`     | Preserves original Anthropic format (direct passthrough)                                                        |
-| `deepseek`      | Adapts for DeepSeek API                                                                                         |
-| `gemini`        | Adapts for Gemini API                                                                                           |
+| `deepseek`      | Adapts for DeepSeek API format                                                                                  |
+| `gemini`        | Adapts for Google Gemini API format                                                                             |
 | `openrouter`    | Adapts for OpenRouter API with [provider routing](https://openrouter.ai/docs/features/provider-routing) support |
-| `groq`          | Adapts for Groq API                                                                                             |
+| `groq`          | Adapts for Groq API format                                                                                      |
 | `maxtoken`      | Sets specific `max_tokens` value                                                                                |
-| `tooluse`       | Optimizes tool usage via `tool_choice`                                                                          |
-| `reasoning`     | Processes `reasoning_content` field                                                                             |
+| `tooluse`       | Optimizes tool usage via `tool_choice` parameter                                                                |
+| `reasoning`     | Processes `reasoning_content` field from responses                                                              |
 | `sampling`      | Processes sampling parameters (temperature, top_p, top_k, repetition_penalty)                                   |
 | `enhancetool`   | Adds error tolerance to tool call parameters (disables streaming for tool calls)                                |
 | `cleancache`    | Clears `cache_control` field from requests                                                                      |
-| `vertex-gemini` | Handles Gemini API with Vertex authentication                                                                   |
-
-### Experimental Transformers
-
-| Transformer  | Description                                 | Link                                                                                            |
-| ------------ | ------------------------------------------- | ----------------------------------------------------------------------------------------------- |
-| `gemini-cli` | Unofficial Gemini via Gemini CLI            | [gemini-cli.js](https://gist.github.com/musistudio/1c13a65f35916a7ab690649d3df8d1cd)            |
-| `qwen-cli`   | Unofficial Qwen3-coder-plus via Qwen CLI    | [qwen-cli.js](https://gist.github.com/musistudio/f5a67841ced39912fd99e42200d5ca8b)              |
-| `rovo-cli`   | Unofficial GPT-5 via Atlassian Rovo Dev CLI | [rovo-cli.js](https://gist.github.com/SaseQ/c2a20a38b11276537ec5332d1f7a5e53)                   |
-| `chutes-glm` | Unofficial GLM 4.5 via Chutes               | [chutes-glm-transformer.js](https://gist.github.com/vitobotta/2be3f33722e05e8d4f9d2b0138b8c863) |
+| `vertex-gemini` | Handles Gemini API with Vertex AI authentication                                                                |
 
 ### Custom Transformers
-
-Create custom transformers and load them via config:
 
 ```json
 {
@@ -634,48 +775,147 @@ Create custom transformers and load them via config:
 }
 ```
 
+---
+
 ## Agent System
 
-The agent system provides specialized handling for specific task types.
+The agent system provides specialized handling for specific task types through an extensible framework.
 
-### Image Agent
-
-The Image Agent enables image analysis for models that don't natively support vision:
+### Agent Architecture
 
 ```mermaid
-flowchart LR
-    subgraph Request["Incoming Request"]
-        Msg[Messages with Images]
-    end
+classDiagram
+    class IAgent {
+        <<interface>>
+        +name: string
+        +shouldHandle(req, config): boolean
+        +reqHandler(req, config, context): void
+        +appendTools(req, config, context): ITool[]
+    }
 
-    subgraph ImageAgent["Image Agent"]
-        Detect[Detect Images]
-        Cache[Cache Images]
-        Replace[Replace with Placeholders]
-        Tool[analyzeImage Tool]
-    end
+    class ITool {
+        <<interface>>
+        +name: string
+        +description: string
+        +input_schema: object
+        +handler(args, context): Promise~any~
+    }
 
-    subgraph Models["Models"]
-        TextModel[Text Model]
-        VisionModel[Vision Model]
-    end
+    class AgentsManager {
+        -agents: Map~string, IAgent~
+        +register(agent: IAgent): void
+        +get(name: string): IAgent
+        +getAll(): IAgent[]
+    }
 
-    Msg --> Detect
-    Detect --> Cache
-    Cache --> Replace
-    Replace --> TextModel
-    TextModel -->|Tool Call| Tool
-    Tool --> VisionModel
-    VisionModel -->|Analysis Result| TextModel
+    class ImageAgent {
+        +name: "image"
+        +imageCache: LRUCache
+        +shouldHandle(req, config): boolean
+        +reqHandler(req, config, context): void
+        +appendTools(req, config, context): ITool[]
+    }
+
+    IAgent <|.. ImageAgent
+    AgentsManager o-- IAgent
+    ImageAgent ..> ITool : creates
 ```
 
-**How it works:**
+### Image Agent Deep Dive
 
-1. Detects image content in messages
-2. Caches images with unique IDs
-3. Replaces images with text placeholders
-4. Provides an `analyzeImage` tool for on-demand analysis
-5. Routes image analysis to a vision-capable model
+**Location:** `src/agents/image.agent.ts`
+
+```mermaid
+flowchart TB
+    subgraph Detection["Image Detection (shouldHandle)"]
+        CheckConfig{Router.image<br/>configured?}
+        CheckImages{Messages contain<br/>images?}
+        CheckForce{forceUseImageAgent?}
+        CheckLastMsg{Images in<br/>last message only?}
+
+        CheckConfig -->|No| ReturnFalse[Return false]
+        CheckConfig -->|Yes| CheckImages
+        CheckImages -->|No| ReturnFalse
+        CheckImages -->|Yes| CheckForce
+        CheckForce -->|Yes| ReturnTrue[Return true<br/>Use agent workflow]
+        CheckForce -->|No| CheckLastMsg
+        CheckLastMsg -->|Yes| DirectRoute[Switch to image model<br/>Return false]
+        CheckLastMsg -->|No| ReturnTrue
+    end
+
+    subgraph Processing["Request Processing (reqHandler)"]
+        IterateMsg[Iterate messages]
+        FindImage{Image content<br/>found?}
+        CacheImage[Store in LRU cache<br/>ID: req.id_Image#N]
+        ReplaceImage[Replace with placeholder<br/>'Image #N: if you need to view...']
+
+        IterateMsg --> FindImage
+        FindImage -->|Yes| CacheImage
+        CacheImage --> ReplaceImage
+        ReplaceImage --> IterateMsg
+        FindImage -->|No| IterateMsg
+    end
+
+    subgraph ToolExecution["analyzeImage Tool"]
+        ToolCall[Model calls analyzeImage]
+        RetrieveImage[Retrieve from cache]
+        BuildRequest[Build vision request]
+        CallVision[POST to Router.image model]
+        ReturnResult[Return analysis result]
+
+        ToolCall --> RetrieveImage
+        RetrieveImage --> BuildRequest
+        BuildRequest --> CallVision
+        CallVision --> ReturnResult
+    end
+```
+
+**Image Cache Implementation:**
+
+```typescript
+// src/agents/image.agent.ts:10-45
+class ImageCache {
+  private cache: LRUCache<string, ImageData>;
+
+  constructor() {
+    this.cache = new LRUCache({
+      max: 100, // Maximum 100 images
+      ttl: 5 * 60000, // 5 minute TTL
+    });
+  }
+
+  storeImage(id: string, data: ImageData): void;
+  getImage(id: string): ImageData | undefined;
+}
+```
+
+**analyzeImage Tool Schema:**
+
+```typescript
+// src/agents/image.agent.ts:103-148
+{
+  name: "analyzeImage",
+  description: "Analyze one or more images...",
+  input_schema: {
+    type: "object",
+    properties: {
+      imageId: {
+        type: ["string", "array"],
+        description: "Image ID(s) to analyze"
+      },
+      task: {
+        type: "string",
+        description: "Analysis task description"
+      },
+      regions: {
+        type: "array",
+        description: "Optional regions of interest"
+      }
+    },
+    required: ["imageId", "task"]
+  }
+}
+```
 
 **Configuration:**
 
@@ -688,19 +928,121 @@ flowchart LR
 }
 ```
 
-Set `forceUseImageAgent: true` if the image model doesn't support tool calling.
+| Setting                               | Behavior                                                                                                                                            |
+| ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `forceUseImageAgent: false` (default) | If images are in the last message only, directly route to vision model. Otherwise, use agent workflow.                                              |
+| `forceUseImageAgent: true`            | Always use agent workflow (replace images with placeholders, provide analyzeImage tool). Use this if your image model doesn't support tool calling. |
 
-## Status Line (Beta)
+---
 
-Enable the integrated status line for real-time model and usage information:
+## Advanced Features
 
-![Status Line Config](/blog/images/statusline-config.png)
+### Trace Mode
 
-![Status Line](/blog/images/statusline.png)
+**Configuration:**
+
+```json
+{
+  "TRACE_MODE": true,
+  "TRACE_INCLUDE_BODIES": true
+}
+```
+
+**Implementation:** `src/middleware/trace.ts`
+
+| Function                 | Location      | Logged Data                       |
+| ------------------------ | ------------- | --------------------------------- |
+| `traceIncomingRequest`   | Lines 74-90   | URL, method, headers, body        |
+| `traceRouterDecision`    | Lines 95-113  | Selected model, token count       |
+| `traceTransformerOutput` | Lines 118-136 | Transformed body, provider        |
+| `traceProviderResponse`  | Lines 141-159 | Raw provider response             |
+| `traceError`             | Lines 183-198 | Error message, stack, status code |
+| `traceAgentTool`         | Lines 203-221 | Tool name, arguments, results     |
+
+### Token Counting Endpoint
+
+```
+POST /v1/messages/count_tokens
+```
+
+**Implementation:** `src/server.ts:13-17`
+
+Uses `tiktoken` with `cl100k_base` encoding for accurate token estimation compatible with Claude models.
+
+### Session and Usage Tracking
+
+**Implementation:** `src/utils/cache.ts`
+
+```typescript
+// LRU cache for session usage
+export const sessionUsageCache = new LRUCache<string, UsageData>({
+  max: 100, // Maximum 100 sessions
+});
+```
+
+**Session ID Extraction:** `src/utils/router.ts:184-190`
+
+```typescript
+const sessionId = req.body.metadata?.user_id?.split("_session_")[1];
+```
+
+**Usage Update:** `src/index.ts:484, 503`
+
+- Streaming responses: Parse `message_delta` events for usage data
+- Non-streaming responses: Extract from `payload.usage`
+
+### Status Line
+
+**Implementation:** `src/utils/statusline.ts`
+
+Supports multiple themes:
+
+- `DEFAULT_THEME` - Nerd Fonts compatible
+- `POWERLINE_THEME` - Powerline fonts
+- `SIMPLE_THEME` - ASCII only
+
+**Data Parsing:** `parseStatusLineData` (lines 427-549)
+
+Displays:
+
+- Working directory (`workDir`)
+- Git branch (`gitBranch`)
+- Current model (`model`)
+- Token usage (`inputTokens`, `outputTokens`) with 'k' suffix formatting
+
+---
+
+## Troubleshooting
+
+### Common Issues
+
+| Issue                 | Solution                                        |
+| --------------------- | ----------------------------------------------- |
+| Service won't start   | Check if port 3456 is in use: `lsof -i :3456`   |
+| Authentication errors | Verify APIKEY in config matches request headers |
+| Provider errors       | Check provider API key and endpoint URL         |
+| Timeout errors        | Increase `API_TIMEOUT_MS` in config             |
+| Streaming issues      | Ensure provider supports streaming              |
+
+### Debug Commands
+
+```shell
+# Check service status
+ccr status
+
+# View server logs (rotating)
+tail -f ~/.claude-code-router/logs/ccr-*.log
+
+# View application logs
+tail -f ~/.claude-code-router/claude-code-router.log
+
+# Enable trace mode for detailed debugging
+# Add to config.json: "TRACE_MODE": true, "TRACE_INCLUDE_BODIES": true
+```
+
+---
 
 ## GitHub Actions Integration
-
-Integrate Claude Code Router into your CI/CD pipeline:
 
 ```yaml
 name: Claude Code
@@ -732,9 +1074,17 @@ jobs:
           {
             "LOG": true,
             "NON_INTERACTIVE_MODE": true,
-            "OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}",
-            "OPENAI_BASE_URL": "https://api.deepseek.com",
-            "OPENAI_MODEL": "deepseek-chat"
+            "Providers": [
+              {
+                "name": "deepseek",
+                "api_base_url": "https://api.deepseek.com/chat/completions",
+                "api_key": "${{ secrets.DEEPSEEK_API_KEY }}",
+                "models": ["deepseek-chat"]
+              }
+            ],
+            "Router": {
+              "default": "deepseek,deepseek-chat"
+            }
           }
           EOF
         shell: bash
@@ -753,78 +1103,17 @@ jobs:
           anthropic_api_key: "any-string-is-ok"
 ```
 
-> **Important:** Set `NON_INTERACTIVE_MODE: true` for CI/CD environments to prevent stdin handling issues.
+> **Important:** Set `NON_INTERACTIVE_MODE: true` for CI/CD environments. This sets `CI=true`, `TERM=dumb`, and `FORCE_COLOR=0` to prevent stdin handling issues.
 
-## Advanced Features
-
-### Trace Mode
-
-Enable detailed request tracing for debugging:
-
-```json
-{
-  "TRACE_MODE": true,
-  "TRACE_INCLUDE_BODIES": true
-}
-```
-
-Trace logs include:
-
-- Incoming request details
-- Router decisions
-- Transformer output
-- Provider responses
-- Error information
-- Agent tool executions
-
-### Token Counting
-
-The router provides a token counting endpoint:
-
-```
-POST /v1/messages/count_tokens
-```
-
-Uses tiktoken (cl100k_base encoding) for accurate token estimation.
-
-### Session and Usage Tracking
-
-The router tracks:
-
-- Session IDs from metadata
-- Token usage per session (cached in LRU cache)
-- Request/response metrics
-
-## Troubleshooting
-
-### Common Issues
-
-| Issue                 | Solution                                        |
-| --------------------- | ----------------------------------------------- |
-| Service won't start   | Check if port 3456 is in use: `lsof -i :3456`   |
-| Authentication errors | Verify APIKEY in config matches request headers |
-| Provider errors       | Check provider API key and endpoint URL         |
-| Timeout errors        | Increase `API_TIMEOUT_MS` in config             |
-| Streaming issues      | Ensure provider supports streaming              |
-
-### Debug Commands
-
-```shell
-# Check service status
-ccr status
-
-# View server logs
-tail -f ~/.claude-code-router/logs/ccr-*.log
-
-# View application logs
-tail -f ~/.claude-code-router/claude-code-router.log
-```
+---
 
 ## Further Reading
 
 - [Project Motivation and How It Works](blog/en/project-motivation-and-how-it-works.md)
 - [Maybe We Can Do More with the Router](blog/en/maybe-we-can-do-more-with-the-route.md)
 - [GLM-4.6 Supports Reasoning and Interleaved Thinking](blog/en/glm-4.6-supports-reasoning.md)
+
+---
 
 ## Support & Sponsoring
 
@@ -840,21 +1129,6 @@ If you find this project helpful, please consider sponsoring its development. Yo
     <td><img src="/blog/images/wechat.jpg" width="200" alt="WeChat Pay" /></td>
   </tr>
 </table>
-
-### Our Sponsors
-
-A huge thank you to all our sponsors for their generous support!
-
-- [AIHubmix](https://aihubmix.com/)
-- [BurnCloud](https://ai.burncloud.com)
-- [302.AI](https://share.302.ai/ZGVF9w)
-- [Z智谱](https://www.bigmodel.cn/claude-code?ic=FPF9IVAGFJ)
-- @Simon Leischnig
-- [@duanshuaimin](https://github.com/duanshuaimin)
-- [@vrgitadmin](https://github.com/vrgitadmin)
-- And many more...
-
-(If your name is masked, please contact me via my homepage email to update it with your GitHub username.)
 
 ---
 

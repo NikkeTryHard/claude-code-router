@@ -6,3 +6,6 @@ dist
 .DS_Store
 .vscode
 tsconfig.tsbuildinfo
+
+# Ruff cache (Python linter)
+.ruff_cache/
