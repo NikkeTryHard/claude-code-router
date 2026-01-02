@@ -24,6 +24,10 @@
 - [Routing System Deep Dive](#routing-system-deep-dive)
 - [Transformer System](#transformer-system)
 - [Agent System](#agent-system)
+- [Web UI API Reference](#web-ui-api-reference)
+- [Process Management](#process-management)
+- [Stream Processing Internals](#stream-processing-internals)
+- [StatusLine Customization](#statusline-customization)
 - [Advanced Features](#advanced-features)
 - [Troubleshooting](#troubleshooting)
 - [Further Reading](#further-reading)
@@ -932,6 +936,681 @@ class ImageCache {
 | ------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `forceUseImageAgent: false` (default) | If images are in the last message only, directly route to vision model. Otherwise, use agent workflow.                                              |
 | `forceUseImageAgent: true`            | Always use agent workflow (replace images with placeholders, provide analyzeImage tool). Use this if your image model doesn't support tool calling. |
+
+---
+
+## Web UI API Reference
+
+The router exposes a comprehensive REST API for programmatic control and integration with the Web UI.
+
+### API Endpoints Overview
+
+```mermaid
+flowchart LR
+    subgraph ConfigAPI["Configuration API"]
+        GetConfig["GET /api/config"]
+        PostConfig["POST /api/config"]
+    end
+
+    subgraph TransformerAPI["Transformer API"]
+        GetTransformers["GET /api/transformers"]
+    end
+
+    subgraph ServiceAPI["Service Control API"]
+        PostRestart["POST /api/restart"]
+    end
+
+    subgraph UpdateAPI["Update API"]
+        GetUpdateCheck["GET /api/update/check"]
+        PostUpdatePerform["POST /api/update/perform"]
+    end
+
+    subgraph LogsAPI["Logs API"]
+        GetLogsFiles["GET /api/logs/files"]
+        GetLogs["GET /api/logs"]
+        DeleteLogs["DELETE /api/logs"]
+    end
+
+    Client[Web UI / API Client] --> ConfigAPI
+    Client --> TransformerAPI
+    Client --> ServiceAPI
+    Client --> UpdateAPI
+    Client --> LogsAPI
+```
+
+### Endpoint Reference
+
+| Endpoint                    | Method | Description                           | Implementation          |
+| --------------------------- | ------ | ------------------------------------- | ----------------------- |
+| `/api/config`               | GET    | Retrieve current configuration        | `src/server.ts:20-22`   |
+| `/api/config`               | POST   | Save new configuration (auto-backup)  | `src/server.ts:37-48`   |
+| `/api/transformers`         | GET    | List all registered transformers      | `src/server.ts:24-34`   |
+| `/api/restart`              | POST   | Restart the router service            | `src/server.ts:51-62`   |
+| `/api/update/check`         | GET    | Check for available updates           | `src/server.ts:77-92`   |
+| `/api/update/perform`       | POST   | Perform update (requires full access) | `src/server.ts:95-112`  |
+| `/api/logs/files`           | GET    | List all log files with metadata      | `src/server.ts:115-146` |
+| `/api/logs`                 | GET    | Read log file contents                | `src/server.ts:149-174` |
+| `/api/logs`                 | DELETE | Clear log file contents               | `src/server.ts:177-199` |
+| `/v1/messages/count_tokens` | POST   | Count tokens in a request             | `src/server.ts:13-17`   |
+
+### Configuration API
+
+**GET /api/config**
+
+Returns the current configuration from `~/.claude-code-router/config.json`.
+
+```bash
+curl http://127.0.0.1:3456/api/config
+```
+
+**POST /api/config**
+
+Saves a new configuration. Automatically creates a backup of the existing configuration before overwriting.
+
+```bash
+curl -X POST http://127.0.0.1:3456/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"PORT": 3456, "Router": {"default": "deepseek,deepseek-chat"}}'
+```
+
+**Response:**
+
+```json
+{ "success": true, "message": "Config saved successfully" }
+```
+
+### Transformer API
+
+**GET /api/transformers**
+
+Lists all registered transformers with their endpoints.
+
+```bash
+curl http://127.0.0.1:3456/api/transformers
+```
+
+**Response:**
+
+```json
+{
+  "transformers": [
+    { "name": "deepseek", "endpoint": "https://api.deepseek.com/chat/completions" },
+    { "name": "openrouter", "endpoint": "https://openrouter.ai/api/v1/chat/completions" }
+  ]
+}
+```
+
+### Update API
+
+**GET /api/update/check**
+
+Checks npm registry for available updates.
+
+```bash
+curl http://127.0.0.1:3456/api/update/check
+```
+
+**Response (update available):**
+
+```json
+{
+  "hasUpdate": true,
+  "latestVersion": "1.2.0",
+  "changelog": "..."
+}
+```
+
+**POST /api/update/perform**
+
+Executes the update process. Requires `accessLevel: "full"` (set via APIKEY authentication).
+
+```bash
+curl -X POST http://127.0.0.1:3456/api/update/perform \
+  -H "x-api-key: your-api-key"
+```
+
+### Logs API
+
+**GET /api/logs/files**
+
+Returns a list of all log files with metadata, sorted by modification time (newest first).
+
+```bash
+curl http://127.0.0.1:3456/api/logs/files
+```
+
+**Response:**
+
+```json
+[
+  {
+    "name": "ccr-20250102120000.log",
+    "path": "/home/user/.claude-code-router/logs/ccr-20250102120000.log",
+    "size": 1024,
+    "lastModified": "2025-01-02T12:00:00.000Z"
+  }
+]
+```
+
+**GET /api/logs?file=\<path\>**
+
+Reads the contents of a specific log file. If no file is specified, reads the default `app.log`.
+
+```bash
+# Read specific log file
+curl "http://127.0.0.1:3456/api/logs?file=/path/to/log.log"
+
+# Read default log
+curl http://127.0.0.1:3456/api/logs
+```
+
+**DELETE /api/logs?file=\<path\>**
+
+Clears the contents of a log file (writes empty string).
+
+```bash
+curl -X DELETE "http://127.0.0.1:3456/api/logs?file=/path/to/log.log"
+```
+
+---
+
+## Process Management
+
+The router implements sophisticated process lifecycle management with reference counting and cross-platform PID tracking.
+
+### Process Management Architecture
+
+```mermaid
+flowchart TB
+    subgraph Lifecycle["Service Lifecycle"]
+        Start["ccr start"] --> CheckRunning{Service Running?}
+        CheckRunning -->|Yes| AlreadyRunning["Exit: Already running"]
+        CheckRunning -->|No| Initialize["Initialize"]
+        Initialize --> SavePID["Save PID to file"]
+        SavePID --> IncrementRef["Increment reference count"]
+        IncrementRef --> Listen["Start Fastify server"]
+    end
+
+    subgraph Shutdown["Shutdown Process"]
+        SIGINT["SIGINT/SIGTERM"] --> Cleanup["Cleanup PID file"]
+        Cleanup --> DecrementRef["Decrement reference count"]
+        DecrementRef --> Exit["Process exit"]
+    end
+
+    subgraph Files["Persistent Files"]
+        PIDFile["~/.claude-code-router/.claude-code-router.pid"]
+        RefCount["/tmp/claude-code-reference-count.txt"]
+    end
+
+    SavePID --> PIDFile
+    IncrementRef --> RefCount
+    DecrementRef --> RefCount
+```
+
+### Reference Counting System
+
+**Location:** `src/utils/processCheck.ts:16-39`
+
+The reference counting system tracks active connections to the router service, enabling graceful shutdown when all clients disconnect.
+
+```typescript
+// Reference count file location
+export const REFERENCE_COUNT_FILE = path.join(os.tmpdir(), "claude-code-reference-count.txt");
+
+// Increment when a client connects
+export function incrementReferenceCount() {
+  let count = existsSync(REFERENCE_COUNT_FILE) ? parseInt(readFileSync(REFERENCE_COUNT_FILE, "utf-8")) || 0 : 0;
+  count++;
+  writeFileSync(REFERENCE_COUNT_FILE, count.toString());
+}
+
+// Decrement when a client disconnects
+export function decrementReferenceCount() {
+  let count = existsSync(REFERENCE_COUNT_FILE) ? parseInt(readFileSync(REFERENCE_COUNT_FILE, "utf-8")) || 0 : 0;
+  count = Math.max(0, count - 1);
+  writeFileSync(REFERENCE_COUNT_FILE, count.toString());
+}
+```
+
+### Cross-Platform PID Checking
+
+**Location:** `src/utils/processCheck.ts:41-92`
+
+The router uses platform-specific methods to verify if the service process is still running:
+
+| Platform    | Method                         | Implementation                            |
+| ----------- | ------------------------------ | ----------------------------------------- |
+| Linux/macOS | `process.kill(pid, 0)`         | Signal 0 checks existence without killing |
+| Windows     | `tasklist /FI "PID eq ${pid}"` | Command-line process listing              |
+
+```typescript
+export function isServiceRunning(): boolean {
+  if (!existsSync(PID_FILE)) return false;
+
+  const pid = parseInt(readFileSync(PID_FILE, "utf-8"), 10);
+
+  try {
+    if (process.platform === "win32") {
+      // Windows: use tasklist command
+      const output = execSync(`tasklist /FI "PID eq ${pid}"`, { stdio: "pipe" }).toString();
+      return output.includes(pid.toString());
+    } else {
+      // Unix: use signal 0
+      process.kill(pid, 0);
+      return true;
+    }
+  } catch (e) {
+    cleanupPidFile();
+    return false;
+  }
+}
+```
+
+### Service Info Retrieval
+
+**Location:** `src/utils/processCheck.ts:122-136`
+
+```typescript
+export async function getServiceInfo() {
+  return {
+    running: await isServiceRunning(),
+    pid: getServicePid(),
+    port: config.PORT || 3456,
+    endpoint: `http://127.0.0.1:${port}`,
+    pidFile: PID_FILE,
+    referenceCount: getReferenceCount(),
+  };
+}
+```
+
+### Log Cleanup System
+
+**Location:** `src/utils/logCleanup.ts`
+
+The router automatically cleans up old log files on startup, keeping only the 9 most recent log files to prevent disk space exhaustion.
+
+```typescript
+export async function cleanupLogFiles(maxFiles: number = 9): Promise<void> {
+  const logsDir = path.join(HOME_DIR, "logs");
+
+  // Filter for ccr-*.log files
+  const logFiles = files
+    .filter((file) => file.startsWith("ccr-") && file.endsWith(".log"))
+    .sort()
+    .reverse(); // Newest first
+
+  // Delete files exceeding the limit
+  if (logFiles.length > maxFiles) {
+    for (let i = maxFiles; i < logFiles.length; i++) {
+      await fs.unlink(path.join(logsDir, logFiles[i]));
+    }
+  }
+}
+```
+
+| Configuration   | Value          | Description                             |
+| --------------- | -------------- | --------------------------------------- |
+| `maxFiles`      | 9              | Maximum number of log files to retain   |
+| Log Pattern     | `ccr-*.log`    | Files matching this pattern are managed |
+| Cleanup Trigger | Server startup | `src/index.ts:69`                       |
+
+---
+
+## Stream Processing Internals
+
+The router implements sophisticated SSE stream processing for real-time response modification, thinking block extraction, and agent tool execution.
+
+### Stream Processing Pipeline
+
+```mermaid
+flowchart LR
+    subgraph Input["Provider Response"]
+        SSE["SSE Stream"]
+    end
+
+    subgraph Parsing["Stream Parsing"]
+        Parser["SSEParserTransform<br/><code>src/utils/SSEParser.transform.ts</code>"]
+    end
+
+    subgraph Processing["Content Processing"]
+        ThinkingExtract["Thinking Block<br/>Extraction"]
+        ToolDetect["Agent Tool<br/>Detection"]
+        UsageTrack["Usage<br/>Tracking"]
+    end
+
+    subgraph Rewriting["Stream Rewriting"]
+        Rewriter["rewriteStream<br/><code>src/utils/rewriteStream.ts</code>"]
+    end
+
+    subgraph Output["Client Response"]
+        Serializer["SSESerializerTransform<br/><code>src/utils/SSESerializer.transform.ts</code>"]
+    end
+
+    SSE --> Parser
+    Parser --> ThinkingExtract
+    Parser --> ToolDetect
+    Parser --> UsageTrack
+    ThinkingExtract --> Rewriter
+    ToolDetect --> Rewriter
+    Rewriter --> Serializer
+```
+
+### Thinking Block Extraction
+
+**Location:** `src/index.ts:268-327`
+
+The router captures thinking blocks from provider responses, preserving the full thinking content and cryptographic signature for verification.
+
+```typescript
+// Track thinking blocks with signatures
+let thinkingBlock: {
+  type: string;
+  thinking: string;
+  signature?: string;
+} | null = null;
+let currentThinkingIndex = -1;
+let thinkingContent = "";
+
+// Capture thinking block start
+if (data.event === "content_block_start" && data?.data?.content_block?.type === "thinking") {
+  currentThinkingIndex = data.data.index;
+  thinkingContent = "";
+  thinkingBlock = { type: "thinking", thinking: "" };
+}
+
+// Capture thinking content incrementally
+if (currentThinkingIndex > -1 && data.data?.delta?.type === "thinking_delta") {
+  thinkingContent += data.data.delta.thinking || "";
+}
+
+// Capture thinking signature
+if (currentThinkingIndex > -1 && data.data?.delta?.type === "signature_delta") {
+  thinkingBlock.signature = data.data.delta.signature;
+}
+
+// Finalize thinking block
+if (data.event === "content_block_stop" && data.data?.index === currentThinkingIndex) {
+  thinkingBlock.thinking = thinkingContent;
+  assistantMessages.unshift(thinkingBlock); // Thinking comes first
+  currentThinkingIndex = -1;
+}
+```
+
+### Auto-Replay on Error
+
+**Location:** `src/index.ts:216-250`
+
+When an error occurs during request processing, the router automatically saves the request for later replay debugging.
+
+```typescript
+server.addHook("onError", async (request, reply, error) => {
+  // Auto-save replay on error (only for /v1/messages requests)
+  if (request.url.startsWith("/v1/messages") && !request.url.startsWith("/v1/messages/count_tokens")) {
+    const replayId = await saveReplay({
+      reqId: request.id || "unknown",
+      url: request.url,
+      method: request.method,
+      headers: request.headers,
+      body: request.body,
+      error: {
+        statusCode: error.statusCode,
+        message: error.message,
+        response: error.response,
+      },
+      metadata: {
+        model: request.body?.model,
+        provider: request.body?.provider,
+        sessionId: request.sessionId,
+      },
+    });
+    request.log.info(`Saved error replay: ${replayId}`);
+  }
+});
+```
+
+### Replay System Details
+
+**Location:** `src/utils/replay.ts`
+
+| Configuration | Value                            | Description                           |
+| ------------- | -------------------------------- | ------------------------------------- |
+| `REPLAY_DIR`  | `~/.claude-code-router/replays/` | Storage directory                     |
+| `MAX_REPLAYS` | 50                               | Maximum stored replays (auto-cleanup) |
+| ID Format     | `YYYY-MM-DDTHH-MM-SS-sss_random` | Timestamp + 6-char random             |
+
+**Replay Data Structure:**
+
+```typescript
+interface ReplayData {
+  id: string; // Unique replay ID
+  timestamp: string; // ISO timestamp
+  reqId: string; // Original request ID
+  url: string; // Request URL
+  method: string; // HTTP method
+  headers: Record<string, string>;
+  body: any; // Request body
+  error?: {
+    statusCode?: number;
+    message: string;
+    response?: any;
+  };
+  metadata: {
+    model?: string;
+    provider?: string;
+    sessionId?: string;
+  };
+}
+```
+
+---
+
+## StatusLine Customization
+
+The StatusLine system provides a highly customizable terminal status display with support for multiple themes, custom colors, and script-based modules.
+
+### StatusLine Architecture
+
+```mermaid
+flowchart TB
+    subgraph Input["Claude Code Hook"]
+        HookData["StatusLineInput<br/>JSON from stdin"]
+    end
+
+    subgraph Processing["StatusLine Processing"]
+        ParseData["parseStatusLineData<br/><code>src/utils/statusline.ts:427-549</code>"]
+        GetTheme["Load Theme Config"]
+        GetVars["Extract Variables"]
+    end
+
+    subgraph Themes["Available Themes"]
+        Default["DEFAULT_THEME<br/>Nerd Fonts icons"]
+        Powerline["POWERLINE_THEME<br/>Powerline segments"]
+        Simple["SIMPLE_THEME<br/>ASCII fallback"]
+        Custom["Custom Theme<br/>from config.json"]
+    end
+
+    subgraph Rendering["Render Pipeline"]
+        RenderDefault["renderDefaultStyle"]
+        RenderPowerline["renderPowerlineStyle"]
+    end
+
+    subgraph Output["Terminal Output"]
+        ANSI["ANSI-colored string"]
+    end
+
+    HookData --> ParseData
+    ParseData --> GetTheme
+    GetTheme --> Default
+    GetTheme --> Powerline
+    GetTheme --> Simple
+    GetTheme --> Custom
+    GetVars --> RenderDefault
+    GetVars --> RenderPowerline
+    RenderDefault --> ANSI
+    RenderPowerline --> ANSI
+```
+
+### Theme Configuration
+
+**Location:** `~/.claude-code-router/config.json`
+
+```json
+{
+  "StatusLine": {
+    "currentStyle": "default",
+    "default": {
+      "modules": [
+        {
+          "type": "workDir",
+          "icon": "󰉋",
+          "text": "{{workDirName}}",
+          "color": "bright_blue"
+        },
+        {
+          "type": "gitBranch",
+          "icon": "",
+          "text": "{{gitBranch}}",
+          "color": "bright_magenta"
+        },
+        {
+          "type": "model",
+          "icon": "󰚩",
+          "text": "{{model}}",
+          "color": "bright_cyan"
+        },
+        {
+          "type": "usage",
+          "icon": "↑",
+          "text": "{{inputTokens}}",
+          "color": "bright_green"
+        },
+        {
+          "type": "usage",
+          "icon": "↓",
+          "text": "{{outputTokens}}",
+          "color": "bright_yellow"
+        }
+      ]
+    },
+    "powerline": {
+      "modules": [
+        {
+          "type": "workDir",
+          "icon": "󰉋",
+          "text": "{{workDirName}}",
+          "color": "white",
+          "background": "bg_bright_blue"
+        }
+      ]
+    }
+  }
+}
+```
+
+### Module Configuration Schema
+
+```typescript
+interface StatusLineModuleConfig {
+  type: string; // Module type: "workDir", "gitBranch", "model", "usage", "script"
+  icon?: string; // Nerd Font icon or Unicode character
+  text: string; // Template with {{variable}} placeholders
+  color?: string; // Foreground color name or hex (#RRGGBB)
+  background?: string; // Background color (for Powerline style)
+  scriptPath?: string; // Path to custom Node.js script (for "script" type)
+}
+```
+
+### Available Variables
+
+| Variable           | Description                    | Source                        |
+| ------------------ | ------------------------------ | ----------------------------- |
+| `{{workDirName}}`  | Current working directory name | `input.workspace.current_dir` |
+| `{{gitBranch}}`    | Current Git branch             | `git branch --show-current`   |
+| `{{model}}`        | Active model name              | Transcript or config          |
+| `{{inputTokens}}`  | Input token count (formatted)  | Last assistant message        |
+| `{{outputTokens}}` | Output token count (formatted) | Last assistant message        |
+
+### Supported Colors
+
+**Named Colors:**
+
+| Standard                           | Bright                                                         |
+| ---------------------------------- | -------------------------------------------------------------- |
+| `black`, `red`, `green`, `yellow`  | `bright_black`, `bright_red`, `bright_green`, `bright_yellow`  |
+| `blue`, `magenta`, `cyan`, `white` | `bright_blue`, `bright_magenta`, `bright_cyan`, `bright_white` |
+
+**Background Colors:** Prefix with `bg_` (e.g., `bg_bright_blue`, `bg_red`)
+
+**Hex Colors:** Full TrueColor support with `#RRGGBB` or `#RGB` format
+
+```json
+{
+  "color": "#FF5733",
+  "background": "bg_#2E3440"
+}
+```
+
+### Custom Script Modules
+
+Create dynamic status line content with custom Node.js scripts:
+
+**config.json:**
+
+```json
+{
+  "StatusLine": {
+    "default": {
+      "modules": [
+        {
+          "type": "script",
+          "scriptPath": "/path/to/custom-module.js",
+          "icon": "⚡",
+          "color": "bright_yellow"
+        }
+      ]
+    }
+  }
+}
+```
+
+**custom-module.js:**
+
+```javascript
+// Receives variables object with workDirName, gitBranch, model, etc.
+module.exports = function (variables) {
+  // Return a string or Promise<string>
+  return `Custom: ${variables.model}`;
+};
+```
+
+### Environment Variables
+
+| Variable                | Effect                                 |
+| ----------------------- | -------------------------------------- |
+| `USE_SIMPLE_ICONS=true` | Force ASCII-only theme (no Nerd Fonts) |
+| `TERM=dumb`             | Auto-fallback to simple theme          |
+| `COLORTERM=truecolor`   | Enable TrueColor (24-bit) support      |
+| `NERD_FONT=*`           | Hint that Nerd Fonts are available     |
+
+### Built-in Themes
+
+**DEFAULT_THEME** (`src/utils/statusline.ts:189-222`):
+
+- Uses Nerd Fonts icons
+- Colored text on terminal background
+- Best for terminals with Nerd Fonts installed
+
+**POWERLINE_THEME** (`src/utils/statusline.ts:225-263`):
+
+- Powerline-style segments with arrows
+- Colored backgrounds with white text
+- Requires Powerline-compatible fonts
+
+**SIMPLE_THEME** (`src/utils/statusline.ts:266-299`):
+
+- ASCII-only icons (arrows)
+- Fallback for unsupported terminals
+- Auto-selected when `TERM=dumb` or `USE_SIMPLE_ICONS=true`
 
 ---
 
