@@ -12,18 +12,24 @@ import {
   savePid,
 } from "./utils/processCheck";
 import { CONFIG_FILE } from "./constants";
-import { createStream } from 'rotating-file-stream';
+import { createStream } from "rotating-file-stream";
 import { HOME_DIR } from "./constants";
 import { sessionUsageCache } from "./utils/cache";
-import {SSEParserTransform} from "./utils/SSEParser.transform";
-import {SSESerializerTransform} from "./utils/SSESerializer.transform";
-import {rewriteStream} from "./utils/rewriteStream";
+import { SSEParserTransform } from "./utils/SSEParser.transform";
+import { SSESerializerTransform } from "./utils/SSESerializer.transform";
+import { rewriteStream } from "./utils/rewriteStream";
 import JSON5 from "json5";
 import { IAgent } from "./agents/type";
 import agentsManager from "./agents";
 import { EventEmitter } from "node:events";
+import {
+  traceIncomingRequest,
+  traceRouterDecision,
+  traceError,
+} from "./middleware/trace";
+import { saveReplay } from "./utils/replay";
 
-const event = new EventEmitter()
+const event = new EventEmitter();
 
 async function initializeClaudeConfig() {
   const homeDir = homedir();
@@ -31,7 +37,7 @@ async function initializeClaudeConfig() {
   if (!existsSync(configPath)) {
     const userID = Array.from(
       { length: 64 },
-      () => Math.random().toString(16)[2]
+      () => Math.random().toString(16)[2],
     ).join("");
     const configContent = {
       numStartups: 184,
@@ -51,7 +57,7 @@ interface RunOptions {
 
 async function run(options: RunOptions = {}) {
   // Check if service is already running
-  const isRunning = await isServiceRunning()
+  const isRunning = await isServiceRunning();
   if (isRunning) {
     console.log("✅ Service is already running in the background.");
     return;
@@ -62,7 +68,6 @@ async function run(options: RunOptions = {}) {
   // Clean up old log files, keeping only the 10 most recent ones
   await cleanupLogFiles();
   const config = await initConfig();
-
 
   let HOST = config.HOST || "127.0.0.1";
 
@@ -95,10 +100,10 @@ async function run(options: RunOptions = {}) {
     : port;
 
   // Configure logger based on config settings
-  const pad = num => (num > 9 ? "" : "0") + num;
+  const pad = (num) => (num > 9 ? "" : "0") + num;
   const generator = (time, index) => {
     if (!time) {
-      time = new Date()
+      time = new Date();
     }
 
     var month = time.getFullYear() + "" + pad(time.getMonth() + 1);
@@ -106,7 +111,7 @@ async function run(options: RunOptions = {}) {
     var hour = pad(time.getHours());
     var minute = pad(time.getMinutes());
 
-    return `./logs/ccr-${month}${day}${hour}${minute}${pad(time.getSeconds())}${index ? `_${index}` : ''}.log`;
+    return `./logs/ccr-${month}${day}${hour}${minute}${pad(time.getSeconds())}${index ? `_${index}` : ""}.log`;
   };
   const loggerConfig =
     config.LOG !== false
@@ -117,7 +122,7 @@ async function run(options: RunOptions = {}) {
             maxFiles: 3,
             interval: "1d",
             compress: false,
-            maxSize: "50M"
+            maxSize: "50M",
           }),
         }
       : false;
@@ -132,7 +137,7 @@ async function run(options: RunOptions = {}) {
       LOG_FILE: join(
         homedir(),
         ".claude-code-router",
-        "claude-code-router.log"
+        "claude-code-router.log",
       ),
     },
     logger: loggerConfig,
@@ -158,13 +163,19 @@ async function run(options: RunOptions = {}) {
     });
   });
   server.addHook("preHandler", async (req, reply) => {
-    if (req.url.startsWith("/v1/messages") && !req.url.startsWith("/v1/messages/count_tokens")) {
-      const useAgents = []
+    if (
+      req.url.startsWith("/v1/messages") &&
+      !req.url.startsWith("/v1/messages/count_tokens")
+    ) {
+      // Trace incoming request
+      traceIncomingRequest(req, config);
+
+      const useAgents = [];
 
       for (const agent of agentsManager.getAllAgents()) {
         if (agent.shouldHandle(req, config)) {
           // 设置agent标识
-          useAgents.push(agent.name)
+          useAgents.push(agent.name);
 
           // change request body
           agent.reqHandler(req, config);
@@ -172,15 +183,17 @@ async function run(options: RunOptions = {}) {
           // append agent tools
           if (agent.tools.size) {
             if (!req.body?.tools?.length) {
-              req.body.tools = []
+              req.body.tools = [];
             }
-            req.body.tools.unshift(...Array.from(agent.tools.values()).map(item => {
-              return {
-                name: item.name,
-                description: item.description,
-                input_schema: item.input_schema
-              }
-            }))
+            req.body.tools.unshift(
+              ...Array.from(agent.tools.values()).map((item) => {
+                return {
+                  name: item.name,
+                  description: item.description,
+                  input_schema: item.input_schema,
+                };
+              }),
+            );
           }
         }
       }
@@ -190,140 +203,267 @@ async function run(options: RunOptions = {}) {
       }
       await router(req, reply, {
         config,
-        event
+        event,
+      });
+
+      // Trace router decision
+      traceRouterDecision(req, config, {
+        selectedModel: req.body.model,
+        tokenCount: (req as any).tokenCount,
       });
     }
   });
   server.addHook("onError", async (request, reply, error) => {
-    event.emit('onError', request, reply, error);
-  })
+    event.emit("onError", request, reply, error);
+
+    // Trace error
+    traceError(request, config, error);
+
+    // Auto-save replay on error (only for /v1/messages requests)
+    if (
+      request.url.startsWith("/v1/messages") &&
+      !request.url.startsWith("/v1/messages/count_tokens")
+    ) {
+      try {
+        const replayId = await saveReplay({
+          reqId: (request as any).id || "unknown",
+          url: request.url,
+          method: request.method,
+          headers: request.headers as Record<string, string>,
+          body: (request as any).body,
+          error: {
+            statusCode: (error as any).statusCode,
+            message: error.message,
+            response: (error as any).response,
+          },
+          metadata: {
+            model: (request as any).body?.model,
+            provider: (request as any).body?.provider,
+            sessionId: (request as any).sessionId,
+          },
+        });
+        request.log.info(`Saved error replay: ${replayId}`);
+      } catch (replayError: any) {
+        request.log.error(`Failed to save replay: ${replayError.message}`);
+      }
+    }
+  });
   server.addHook("onSend", (req, reply, payload, done) => {
-    if (req.sessionId && req.url.startsWith("/v1/messages") && !req.url.startsWith("/v1/messages/count_tokens")) {
+    if (
+      req.sessionId &&
+      req.url.startsWith("/v1/messages") &&
+      !req.url.startsWith("/v1/messages/count_tokens")
+    ) {
       if (payload instanceof ReadableStream) {
         if (req.agents) {
           const abortController = new AbortController();
-          const eventStream = payload.pipeThrough(new SSEParserTransform())
+          const eventStream = payload.pipeThrough(new SSEParserTransform());
           let currentAgent: undefined | IAgent;
-          let currentToolIndex = -1
-          let currentToolName = ''
-          let currentToolArgs = ''
-          let currentToolId = ''
-          const toolMessages: any[] = []
-          const assistantMessages: any[] = []
+          let currentToolIndex = -1;
+          let currentToolName = "";
+          let currentToolArgs = "";
+          let currentToolId = "";
+          const toolMessages: any[] = [];
+          const assistantMessages: any[] = [];
+          // Track thinking blocks with signatures
+          let thinkingBlock: {
+            type: string;
+            thinking: string;
+            signature?: string;
+          } | null = null;
+          let currentThinkingIndex = -1;
+          let thinkingContent = "";
           // 存储Anthropic格式的消息体，区分文本和工具类型
-          return done(null, rewriteStream(eventStream, async (data, controller) => {
-            try {
-              // 检测工具调用开始
-              if (data.event === 'content_block_start' && data?.data?.content_block?.name) {
-                const agent = req.agents.find((name: string) => agentsManager.getAgent(name)?.tools.get(data.data.content_block.name))
-                if (agent) {
-                  currentAgent = agentsManager.getAgent(agent)
-                  currentToolIndex = data.data.index
-                  currentToolName = data.data.content_block.name
-                  currentToolId = data.data.content_block.id
-                  return undefined;
+          return done(
+            null,
+            rewriteStream(eventStream, async (data, controller) => {
+              try {
+                // Capture thinking block start
+                if (
+                  data.event === "content_block_start" &&
+                  data?.data?.content_block?.type === "thinking"
+                ) {
+                  currentThinkingIndex = data.data.index;
+                  thinkingContent = "";
+                  thinkingBlock = {
+                    type: "thinking",
+                    thinking: "",
+                  };
                 }
-              }
 
-              // 收集工具参数
-              if (currentToolIndex > -1 && data.data.index === currentToolIndex && data.data?.delta?.type === 'input_json_delta') {
-                currentToolArgs += data.data?.delta?.partial_json;
-                return undefined;
-              }
-
-              // 工具调用完成，处理agent调用
-              if (currentToolIndex > -1 && data.data.index === currentToolIndex && data.data.type === 'content_block_stop') {
-                try {
-                  const args = JSON5.parse(currentToolArgs);
-                  assistantMessages.push({
-                    type: "tool_use",
-                    id: currentToolId,
-                    name: currentToolName,
-                    input: args
-                  })
-                  const toolResult = await currentAgent?.tools.get(currentToolName)?.handler(args, {
-                    req,
-                    config
-                  });
-                  toolMessages.push({
-                    "tool_use_id": currentToolId,
-                    "type": "tool_result",
-                    "content": toolResult
-                  })
-                  currentAgent = undefined
-                  currentToolIndex = -1
-                  currentToolName = ''
-                  currentToolArgs = ''
-                  currentToolId = ''
-                } catch (e) {
-                  console.log(e);
+                // Capture thinking content
+                if (
+                  currentThinkingIndex > -1 &&
+                  data.data?.index === currentThinkingIndex &&
+                  data.data?.delta?.type === "thinking_delta"
+                ) {
+                  thinkingContent += data.data.delta.thinking || "";
                 }
-                return undefined;
-              }
 
-              if (data.event === 'message_delta' && toolMessages.length) {
-                req.body.messages.push({
-                  role: 'assistant',
-                  content: assistantMessages
-                })
-                req.body.messages.push({
-                  role: 'user',
-                  content: toolMessages
-                })
-                const response = await fetch(`http://127.0.0.1:${config.PORT || 3456}/v1/messages`, {
-                  method: "POST",
-                  headers: {
-                    'x-api-key': config.APIKEY,
-                    'content-type': 'application/json',
-                  },
-                  body: JSON.stringify(req.body),
-                })
-                if (!response.ok) {
-                  return undefined;
-                }
-                const stream = response.body!.pipeThrough(new SSEParserTransform())
-                const reader = stream.getReader()
-                while (true) {
-                  try {
-                    const {value, done} = await reader.read();
-                    if (done) {
-                      break;
-                    }
-                    if (['message_start', 'message_stop'].includes(value.event)) {
-                      continue
-                    }
-
-                    // 检查流是否仍然可写
-                    if (!controller.desiredSize) {
-                      break;
-                    }
-
-                    controller.enqueue(value)
-                  }catch (readError: any) {
-                    if (readError.name === 'AbortError' || readError.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-                      abortController.abort(); // 中止所有相关操作
-                      break;
-                    }
-                    throw readError;
+                // Capture thinking signature
+                if (
+                  currentThinkingIndex > -1 &&
+                  data.data?.index === currentThinkingIndex &&
+                  data.data?.delta?.type === "signature_delta"
+                ) {
+                  if (thinkingBlock) {
+                    thinkingBlock.signature = data.data.delta.signature;
                   }
-
                 }
-                return undefined
-              }
-              return data
-            }catch (error: any) {
-              console.error('Unexpected error in stream processing:', error);
 
-              // 处理流提前关闭的错误
-              if (error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-                abortController.abort();
-                return undefined;
-              }
+                // Finalize thinking block
+                if (
+                  currentThinkingIndex > -1 &&
+                  data.data?.index === currentThinkingIndex &&
+                  data.event === "content_block_stop"
+                ) {
+                  if (thinkingBlock) {
+                    thinkingBlock.thinking = thinkingContent;
+                    // Add thinking block to assistant messages (must come first)
+                    assistantMessages.unshift(thinkingBlock);
+                  }
+                  currentThinkingIndex = -1;
+                  thinkingContent = "";
+                }
 
-              // 其他错误仍然抛出
-              throw error;
-            }
-          }).pipeThrough(new SSESerializerTransform()))
+                // 检测工具调用开始
+                if (
+                  data.event === "content_block_start" &&
+                  data?.data?.content_block?.name
+                ) {
+                  const agent = req.agents.find((name: string) =>
+                    agentsManager
+                      .getAgent(name)
+                      ?.tools.get(data.data.content_block.name),
+                  );
+                  if (agent) {
+                    currentAgent = agentsManager.getAgent(agent);
+                    currentToolIndex = data.data.index;
+                    currentToolName = data.data.content_block.name;
+                    currentToolId = data.data.content_block.id;
+                    return undefined;
+                  }
+                }
+
+                // 收集工具参数
+                if (
+                  currentToolIndex > -1 &&
+                  data.data.index === currentToolIndex &&
+                  data.data?.delta?.type === "input_json_delta"
+                ) {
+                  currentToolArgs += data.data?.delta?.partial_json;
+                  return undefined;
+                }
+
+                // 工具调用完成，处理agent调用
+                if (
+                  currentToolIndex > -1 &&
+                  data.data.index === currentToolIndex &&
+                  data.data.type === "content_block_stop"
+                ) {
+                  try {
+                    const args = JSON5.parse(currentToolArgs);
+                    assistantMessages.push({
+                      type: "tool_use",
+                      id: currentToolId,
+                      name: currentToolName,
+                      input: args,
+                    });
+                    const toolResult = await currentAgent?.tools
+                      .get(currentToolName)
+                      ?.handler(args, {
+                        req,
+                        config,
+                      });
+                    toolMessages.push({
+                      tool_use_id: currentToolId,
+                      type: "tool_result",
+                      content: toolResult,
+                    });
+                    currentAgent = undefined;
+                    currentToolIndex = -1;
+                    currentToolName = "";
+                    currentToolArgs = "";
+                    currentToolId = "";
+                  } catch (e) {
+                    console.log(e);
+                  }
+                  return undefined;
+                }
+
+                if (data.event === "message_delta" && toolMessages.length) {
+                  req.body.messages.push({
+                    role: "assistant",
+                    content: assistantMessages,
+                  });
+                  req.body.messages.push({
+                    role: "user",
+                    content: toolMessages,
+                  });
+                  const response = await fetch(
+                    `http://127.0.0.1:${config.PORT || 3456}/v1/messages`,
+                    {
+                      method: "POST",
+                      headers: {
+                        "x-api-key": config.APIKEY,
+                        "content-type": "application/json",
+                      },
+                      body: JSON.stringify(req.body),
+                    },
+                  );
+                  if (!response.ok) {
+                    return undefined;
+                  }
+                  const stream = response.body!.pipeThrough(
+                    new SSEParserTransform(),
+                  );
+                  const reader = stream.getReader();
+                  while (true) {
+                    try {
+                      const { value, done } = await reader.read();
+                      if (done) {
+                        break;
+                      }
+                      if (
+                        ["message_start", "message_stop"].includes(value.event)
+                      ) {
+                        continue;
+                      }
+
+                      // 检查流是否仍然可写
+                      if (!controller.desiredSize) {
+                        break;
+                      }
+
+                      controller.enqueue(value);
+                    } catch (readError: any) {
+                      if (
+                        readError.name === "AbortError" ||
+                        readError.code === "ERR_STREAM_PREMATURE_CLOSE"
+                      ) {
+                        abortController.abort(); // 中止所有相关操作
+                        break;
+                      }
+                      throw readError;
+                    }
+                  }
+                  return undefined;
+                }
+                return data;
+              } catch (error: any) {
+                console.error("Unexpected error in stream processing:", error);
+
+                // 处理流提前关闭的错误
+                if (error.code === "ERR_STREAM_PREMATURE_CLOSE") {
+                  abortController.abort();
+                  return undefined;
+                }
+
+                // 其他错误仍然抛出
+                throw error;
+              }
+            }).pipeThrough(new SSESerializerTransform()),
+          );
         }
 
         const [originalStream, clonedStream] = payload.tee();
@@ -345,37 +485,39 @@ async function run(options: RunOptions = {}) {
               } catch {}
             }
           } catch (readError: any) {
-            if (readError.name === 'AbortError' || readError.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-              console.error('Background read stream closed prematurely');
+            if (
+              readError.name === "AbortError" ||
+              readError.code === "ERR_STREAM_PREMATURE_CLOSE"
+            ) {
+              console.error("Background read stream closed prematurely");
             } else {
-              console.error('Error in background stream reading:', readError);
+              console.error("Error in background stream reading:", readError);
             }
           } finally {
             reader.releaseLock();
           }
-        }
+        };
         read(clonedStream);
-        return done(null, originalStream)
+        return done(null, originalStream);
       }
       sessionUsageCache.put(req.sessionId, payload.usage);
-      if (typeof payload ==='object') {
+      if (typeof payload === "object") {
         if (payload.error) {
-          return done(payload.error, null)
+          return done(payload.error, null);
         } else {
-          return done(payload, null)
+          return done(payload, null);
         }
       }
     }
-    if (typeof payload ==='object' && payload.error) {
-      return done(payload.error, null)
+    if (typeof payload === "object" && payload.error) {
+      return done(payload.error, null);
     }
-    done(null, payload)
+    done(null, payload);
   });
   server.addHook("onSend", async (req, reply, payload) => {
-    event.emit('onSend', req, reply, payload);
+    event.emit("onSend", req, reply, payload);
     return payload;
-  })
-
+  });
 
   server.start();
 }

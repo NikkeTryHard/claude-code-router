@@ -1,0 +1,47 @@
+{
+  "LOG": true,
+  "LOG_LEVEL": "info",
+  "HOST": "127.0.0.1",
+  "PORT": 3456,
+  "APIKEY": "your-ccr-api-key",
+  "API_TIMEOUT_MS": 600000,
+
+  "TRACE_MODE": false,
+  "TRACE_INCLUDE_BODIES": false,
+
+  "transformers": [
+    {
+      "path": "./scripts/pure-passthrough.js"
+    }
+  ],
+
+  "Providers": [
+    {
+      "name": "gcli2api",
+      "api_base_url": "http://127.0.0.1:7861/antigravity/v1/messages",
+      "api_key": "${GCLI2API_PASSWORD}",
+      "nativeFormat": true,
+      "models": [
+        "claude-sonnet-4-5",
+        "claude-opus-4-5-thinking",
+        "claude-opus-4-5-nothinking",
+        "gemini-2.5-pro",
+        "gemini-2.5-flash"
+      ],
+      "transformer": {
+        "use": ["pure-passthrough"]
+      }
+    }
+  ],
+
+  "Router": {
+    "default": "gcli2api,claude-sonnet-4-5",
+    "background": "gcli2api,gemini-2.5-flash",
+    "think": "gcli2api,claude-opus-4-5-thinking",
+    "longContext": "gcli2api,gemini-2.5-pro",
+    "longContextThreshold": 60000,
+    "webSearch": "gcli2api,gemini-2.5-flash"
+  },
+
+  "NON_INTERACTIVE_MODE": false
+}

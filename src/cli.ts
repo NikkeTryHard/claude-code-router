@@ -31,6 +31,7 @@ Commands:
   model         Interactive model selection and configuration
   activate      Output environment variables for shell integration
   ui            Open the web UI in browser
+  replay        Manage request replays (list, run, clear)
   -v, version   Show version information
   -h, help      Show help information
 
@@ -40,18 +41,20 @@ Example:
   ccr model
   eval "$(ccr activate)"  # Set environment variables globally
   ccr ui
+  ccr replay list
+  ccr replay run latest
 `;
 
 async function waitForService(
   timeout = 10000,
-  initialDelay = 1000
+  initialDelay = 1000,
 ): Promise<boolean> {
   // Wait for an initial period to let the service initialize
   await new Promise((resolve) => setTimeout(resolve, initialDelay));
 
   const startTime = Date.now();
   while (Date.now() - startTime < timeout) {
-    const isRunning = await isServiceRunning()
+    const isRunning = await isServiceRunning();
     if (isRunning) {
       // Wait for an additional short period to ensure service is fully ready
       await new Promise((resolve) => setTimeout(resolve, 500));
@@ -63,7 +66,7 @@ async function waitForService(
 }
 
 async function main() {
-  const isRunning = await isServiceRunning()
+  const isRunning = await isServiceRunning();
   switch (command) {
     case "start":
       run();
@@ -81,11 +84,11 @@ async function main() {
           }
         }
         console.log(
-          "claude code router service has been successfully stopped."
+          "claude code router service has been successfully stopped.",
         );
       } catch (e) {
         console.log(
-          "Failed to stop the service. It may have already been stopped."
+          "Failed to stop the service. It may have already been stopped.",
         );
         cleanupPidFile();
       }
@@ -157,7 +160,7 @@ async function main() {
           executeCodeCommand(codeArgs);
         } else {
           console.error(
-            "Service startup timeout, please manually run `ccr start` to start the service"
+            "Service startup timeout, please manually run `ccr start` to start the service",
           );
           process.exit(1);
         }
@@ -187,7 +190,7 @@ async function main() {
         if (!(await waitForService())) {
           // If service startup fails, try to start with default config
           console.log(
-            "Service startup timeout, trying to start with default configuration..."
+            "Service startup timeout, trying to start with default configuration...",
           );
           const {
             initDir,
@@ -203,7 +206,7 @@ async function main() {
             const backupPath = await backupConfigFile();
             if (backupPath) {
               console.log(
-                `Backed up existing configuration file to ${backupPath}`
+                `Backed up existing configuration file to ${backupPath}`,
               );
             }
 
@@ -214,10 +217,10 @@ async function main() {
               Router: {},
             });
             console.log(
-              "Created minimal default configuration file at ~/.claude-code-router/config.json"
+              "Created minimal default configuration file at ~/.claude-code-router/config.json",
             );
             console.log(
-              "Please edit this file with your actual configuration."
+              "Please edit this file with your actual configuration.",
             );
 
             // Try starting the service again
@@ -229,7 +232,7 @@ async function main() {
             restartProcess.on("error", (error) => {
               console.error(
                 "Failed to start service with default config:",
-                error.message
+                error.message,
               );
               process.exit(1);
             });
@@ -239,14 +242,14 @@ async function main() {
             if (!(await waitForService(15000))) {
               // Wait a bit longer for the first start
               console.error(
-                "Service startup still failing. Please manually run `ccr start` to start the service and check the logs."
+                "Service startup still failing. Please manually run `ccr start` to start the service and check the logs.",
               );
               process.exit(1);
             }
           } catch (error: any) {
             console.error(
               "Failed to create default configuration:",
-              error.message
+              error.message,
             );
             process.exit(1);
           }
@@ -324,6 +327,10 @@ async function main() {
 
       startProcess.unref();
       console.log("✅ Service started successfully in the background.");
+      break;
+    case "replay":
+      const { handleReplayCommand } = require("./utils/replayCommand");
+      await handleReplayCommand(process.argv.slice(3));
       break;
     case "-h":
     case "help":
