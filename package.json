@@ -7,7 +7,8 @@
   },
   "scripts": {
     "build": "node scripts/build.js",
-    "release": "npm run build && npm publish"
+    "release": "npm run build && npm publish",
+    "postinstall": "patch-package"
   },
   "keywords": [
     "claude",
@@ -37,6 +38,7 @@
     "@types/node": "^24.0.15",
     "esbuild": "^0.25.1",
     "fastify": "^5.4.0",
+    "patch-package": "^8.0.0",
     "shx": "^0.4.0",
     "typescript": "^5.8.2"
   },
